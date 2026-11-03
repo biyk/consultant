@@ -1,0 +1,5 @@
+flask==3.1.3
+pywin32==312
+pywinauto==0.6.9
+comtypes==1.4.17
+striprtf

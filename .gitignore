@@ -1,0 +1,28 @@
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Настройки IDE
+.idea/
+.vscode/
+
+# Логи и диагностические дампы
+logs/
+*.log
+
+# Runtime-данные сервера: кэш поиска/документов/RTF, трекер issues
+data/
+
+# Временные файлы
+_dump.txt
+*.tmp
+
+# Диагностические дампы проб (UIA-интроспекция)
+server/probe_*.txt
