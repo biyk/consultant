@@ -17,7 +17,8 @@ import uuid
 from flask import Flask, jsonify, request
 
 from . import cache_store, config, rtf_util
-from .consultant_gui import ConsultantGUI, GuiError, NotFound
+from .consultant_gui import (ConsultantGUI, GuiError, NotFound,
+                             pick_section, slice_sections)
 from .logutil import get_logger
 
 LOG = get_logger("app")   # шагам /search нужна запись в logs/server.log
@@ -125,6 +126,10 @@ def manifest():
             "POST /toc": "{index | row | ref} -> оглавление документа "
                          "{toc:[{title,level}], count, has_toc} (структура "
                          "Раздел/Глава/Статья; пусто, если не структурирован)",
+            "POST /section": "{index | row | ref, want} -> текст ОДНОГО раздела "
+                             "по заголовку/номеру из /toc (want=\"Глава 4\", \"12.1\") "
+                             "— чистая резка экспортированного текста по оглавлению; "
+                             "нет совпадения -> unknown_section + available[]",
             "POST /open": "{title} | {ref} | {uri} -> прямой доступ (404, если точного совпадения нет)",
             "POST /back": "-> вверх по стеку",
             "GET/POST/PATCH /issues": "трекер заявок; GET /issues?status=open|closed|<status>"
@@ -1256,6 +1261,84 @@ def toc():
     except GuiError as e:
         return jsonify({"ok": False, "error": "gui_error", "detail": str(e),
                         "retryable": True, "toc": [], **base}), 502
+
+
+@app.post("/section")
+def section():
+    """Текст ОДНОГО раздела крупного документа по заголовку из оглавления.
+
+    Продолжение §13.4 п.1/п.5 БЕЗ рискованной навигации по дереву: берём строку
+    текущей выдачи (index|row|ref, как /doc), открываем её, экспортируем полный
+    текст (путь /doc) и читаем оглавление (путь /toc), затем ЧИСТО (pure-
+    функция slice_sections/pick_section) режем текст по заголовкам и отдаём тело
+    запрошенного раздела want (например {want: "Глава 4"} или "12.1").
+    Офлайн-зонд: на реальном КоАП 38/38 пунктов /toc встречаются в тексте /doc.
+    want не найден среди заголовков — честный unknown_section с available[]
+    (текст НЕ выдумываем)."""
+    b = _body()
+    sess = state["session"]
+    idx, err = _resolve_row(b, sess, "/section")
+    if err:
+        return jsonify(err[0]), err[1]
+    docs = sess["docs"]
+    row = docs[idx]
+    title = row.get("title") or ""
+    want = (b.get("want") or b.get("section") or "").strip()
+    base = {"matched_index": idx, "matched_title": title, "index_base": 0,
+            "abs": row.get("abs"), "ref": row.get("ref"), "want": want,
+            "requested": {k: b[k] for k in ("page", "index", "row", "ref") if k in b}}
+    if not want:
+        return jsonify({"ok": False, "error": "want_required",
+                        "detail": "передай {want|section} — заголовок или номер "
+                                  "раздела из /toc (например \"Глава 4\", \"12.1\")",
+                        **base}), 400
+    dkey = cache_store.doc_key(title)
+
+    def work():
+        _ensure_gui()
+        abs_i = row["abs"]
+        _gui.ensure_doc_open(abs_i)
+        text = ""
+        for _attempt in range(3):
+            _gui.goto_doc_index(abs_i)
+            _t, text, _links = _gui.export_current_doc(dkey)
+            if text and len(text) > config.DOC_MIN_CONTENT:
+                break
+            time.sleep(0.6)
+        entries = _gui.read_toc() or []
+        # читалка увела с списка — дальше только повторный /search (как /toc)
+        state["session"]["openable"] = False
+        text, repaired = _prep_text(text)
+        spans = [s for s in slice_sections(text, entries) if s["found"]]
+        if not text or len(text) <= config.DOC_MIN_CONTENT:
+            return {"ok": False, "error": "doc_unavailable", "retryable": True,
+                    "toc_total": len(entries), "toc_found": len(spans), **base,
+                    "message": "doc_unavailable: экспорт пуст/обрезан — повтори /section"}
+        if not entries:
+            return {"ok": False, "error": "no_toc", "retryable": False, **base,
+                    "message": "у этого документа оглавления нет — он не "
+                               "структурирован; текст целиком бери /doc"}
+        sec = pick_section(text, entries, want)
+        if sec is None:
+            return {"ok": False, "error": "unknown_section", "retryable": False,
+                    "toc_total": len(entries), "toc_found": len(spans),
+                    "available": [s["title"] for s in spans], "_status": 400, **base,
+                    "message": "section_not_found: %r не совпало ни с одним "
+                               "заголовком оглавления — выбери из available "
+                               "(или сходи в /toc)" % want}
+        return {"ok": True, "section": sec, "content_charset": "utf-8",
+                "mojibake_repaired": repaired, "toc_total": len(entries),
+                "toc_found": len(spans), "total_sections": len(spans), **base,
+                "note": "section.text = тело раздела от его заголовка до "
+                        "следующего заголовка оглавления (чистая резка текста)"}
+
+    try:
+        return _respond(gui_call("/section", work))
+    except Busy as e:
+        return jsonify({"ok": False, "error": "gui_busy", "busy": e.args[0]}), 504
+    except GuiError as e:
+        return jsonify({"ok": False, "error": "gui_error", "detail": str(e),
+                        "retryable": True, **base}), 502
 
 
 @app.post("/back")

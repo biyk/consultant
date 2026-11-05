@@ -85,6 +85,120 @@ def parse_toc_entries(items):
     return out
 
 
+# --- привязка пунктов оглавления к кускам текста (ЧИСТЫЕ, без GUI) -----------
+# Офлайн-разведка (§13.4 п.5): на реальном КоАП ВСЕ пункты /toc встречаются в
+# экспортированном тексте /doc (38/38), поэтому подраздел можно достать резкой
+# текста по заголовкам — детерминированно и без рискованной навигации по дереву
+# (клик по пункту оглавления ломает читалку / открывает UIA-невидимые модалки).
+_RE_TOC_LABEL = re.compile(
+    r"\b(\u0440\u0430\u0437\u0434\u0435\u043b|\u0433\u043b\u0430\u0432\u0430|"
+    r"\u0441\u0442\u0430\u0442\u044c\u044f|\u0447\u0430\u0441\u0442\u044c|"
+    r"\u043f\u0430\u0440\u0430\u0433\u0440\u0430\u0444|\u043f\u0443\u043d\u043a\u0442)"
+    r"\.?\s+", re.I)
+
+
+def _norm_ws(s):
+    """Нормализация для матчинга заголовков: nbsp→пробел, схлоп пробелов, lower."""
+    s = (s or "").replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _iter_line_offsets(text):
+    """[(start_offset, line), …] по text (line без переноса строк)."""
+    out, pos = [], 0
+    for ln in text.splitlines(keepends=True):
+        body = ln.rstrip("\r\n")
+        out.append((pos, body))
+        pos += len(ln)
+    return out
+
+
+def slice_sections(text, toc):
+    """Привязать упорядоченные пункты оглавления к диапазонам символов текста.
+
+    ЧИСТАЯ функция — тестируется офлайн. Каждый заголовок ищется НА НАЧАЛЕ
+    СТРОКИ (нормализуя пробелы/nbsp/регистр) и монотонно: следующий ищем не
+    раньше конца предыдущего найденного. Поэтому случайное упоминание вида
+    «…см. главу 1…» внутри чужого тела заголовком не считается. Возвращает
+    список по порядку toc: {title, level, start, end, found}; для найденных
+    end — start следующего найденного (или len(text)). start/end — индексы
+    среза text[start:end]."""
+    if not text or not toc:
+        return []
+    lines = _iter_line_offsets(text)
+    nlines = [_norm_ws(ln) for _, ln in lines]
+    ptr, spans = 0, []
+    for e in toc:
+        title = e.get("title") or ""
+        key = _norm_ws(title)
+        found_at = None
+        if key:
+            for li in range(ptr, len(lines)):
+                nl = nlines[li]
+                if nl and (nl == key or nl.startswith(key)):
+                    found_at = li
+                    break
+            if found_at is None:               # мягкий запасной путь: матчинг
+                strip_key = _norm_ws(_RE_TOC_LABEL.sub("", key))  # без «глава/ст.»
+                if strip_key:
+                    for li in range(ptr, len(lines)):
+                        nl = _norm_ws(_RE_TOC_LABEL.sub("", nlines[li]))
+                        if nl and (nl == strip_key or nl.startswith(strip_key)):
+                            found_at = li
+                            break
+        if found_at is None:
+            spans.append({"title": title, "level": e.get("level"),
+                          "start": None, "end": None, "found": False})
+        else:
+            spans.append({"title": title, "level": e.get("level"),
+                          "start": lines[found_at][0], "end": None, "found": True})
+            ptr = found_at + 1
+    found_idx = [i for i, s in enumerate(spans) if s["found"]]
+    for j, i in enumerate(found_idx):
+        nxt = found_idx[j + 1] if j + 1 < len(found_idx) else None
+        spans[i]["end"] = spans[nxt]["start"] if nxt is not None else len(text)
+    return spans
+
+
+def pick_section(text, toc, want):
+    """Текст ОДНОГО раздела по названию/номеру want (например «Глава 4» или
+    «ст. 12.1»). ЧИСТАЯ. Совпадение ранжируется: точное равенство нормы >
+    заголовок НАЧИНАЕТСЯ с want на границе слова/числа > то же со снятием
+    служебных слов («глава/ст.»). Граница обязательна: «Глава 1» НЕ должно
+    матчиться на «Глава 11» (нумерация статей/глав — юридически разные
+    разделы, неверная выдача хуже честного отказа). Возвращает {title, level,
+    start, end, text, text_len} или None, если раздел не найден (тогда calling
+    код честно перечислит доступные заголовки, а не выдумает текст)."""
+    spans = [s for s in slice_sections(text, toc) if s["found"]]
+    w = _norm_ws(want)
+    if not spans or not w:
+        return None
+    ws = _norm_ws(_RE_TOC_LABEL.sub("", w))
+
+    def _pick(pred):
+        for s in spans:
+            if pred(_norm_ws(s["title"])):
+                return s
+        return None
+
+    def _prefix_boundary(t, pfx):
+        # t начинается с pfx, и дальше — НЕ цифра (граница номера/слова)
+        return t.startswith(pfx) and (len(t) == len(pfx) or not t[len(pfx)].isdigit())
+
+    matched = _pick(lambda t: t == w)
+    if matched is None:
+        matched = _pick(lambda t: _prefix_boundary(t, w))
+    if matched is None and ws:
+        matched = _pick(lambda t: _prefix_boundary(
+            _norm_ws(_RE_TOC_LABEL.sub("", t)), ws))
+    if matched is None:
+        return None
+    body = text[matched["start"]:matched["end"]].rstrip("\r\n")
+    return {"title": matched["title"], "level": matched["level"],
+            "start": matched["start"], "end": matched["end"],
+            "text": body, "text_len": len(body)}
+
+
 # --- буфер обмена (кириллица без зависимости от раскладки) -------------------
 def _clip_set_text(text):
     win32clipboard.OpenClipboard()

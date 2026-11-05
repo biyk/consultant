@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server import app as A  # noqa: E402
 from server import config  # noqa: E402
 from server import rtf_util  # noqa: E402
-from server.consultant_gui import NotFound, parse_toc_entries  # noqa: E402
+from server.consultant_gui import (NotFound, parse_toc_entries,
+                                    slice_sections, pick_section)  # noqa: E402
 
 
 class FakeGUI:
@@ -757,6 +758,132 @@ class TestToc(BaseCase):
         s, j = self.post("/toc", {"index": 0})
         self.assertEqual(s, 400)
         self.assertEqual(j["error"], "list_not_active")
+
+
+# ---------------------------------------------------- чистая резка по оглавлению
+_TOC_TEXT = "\n".join([
+    "КОДЕКС. НАЧАЛО ТЕКСТА",
+    "Раздел I. Общие положения",
+    "предраздельный текст",
+    "Глава 1. Задачи",
+    "текст главы один",
+    "См. также главу 2 ниже.",            # ловушка: упоминание, НЕ заголовок
+    "Глава 2. Ответственность",
+    "текст главы два",
+    "Статья 12.1. Одинаковая формулировка",
+    "тело статьи",
+    "Раздел II. Особенная часть",
+    "текст раздела два",
+])
+_TOC_LIST = [
+    {"title": "Раздел I. Общие положения", "level": 0},
+    {"title": "Глава 1. Задачи", "level": 1},
+    {"title": "Глава 2. Ответственность", "level": 1},
+    {"title": "Статья 12.1. Одинаковая формулировка", "level": 2},
+    {"title": "Раздел II. Особенная часть", "level": 0},
+]
+
+
+class TestSectionSlicing(unittest.TestCase):
+    """Чистые slice_sections/pick_section — без GUI (офлайн)."""
+
+    def test_all_toc_found_and_spans_contiguous(self):
+        spans = slice_sections(_TOC_TEXT, _TOC_LIST)
+        self.assertTrue(all(s["found"] for s in spans))
+        # границы стыкуются: end каждого == start следующего
+        for a, b in zip(spans, spans[1:]):
+            self.assertEqual(a["end"], b["start"])
+        self.assertEqual(spans[-1]["end"], len(_TOC_TEXT))
+
+    def test_heading_line_start_not_a_passing_mention(self):
+        # «См. также главу 2 ниже.» внутри тела не должен считаться заголовком
+        spans = {s["title"]: s for s in slice_sections(_TOC_TEXT, _TOC_LIST)}
+        st = spans["Глава 2. Ответственность"]["start"]
+        self.assertEqual(_TOC_TEXT[st:].splitlines()[0],
+                         "Глава 2. Ответственность")
+
+    def test_pick_full_title_returns_body_until_next_heading(self):
+        sec = pick_section(_TOC_TEXT, _TOC_LIST, "Глава 2. Ответственность")
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["text"],
+                         _TOC_TEXT.splitlines()[6] + "\n" + _TOC_TEXT.splitlines()[7])
+        self.assertTrue(sec["text"].startswith("Глава 2"))
+        self.assertNotIn("Статья 12.1", sec["text"])
+
+    def test_pick_by_bare_number_labelless(self):
+        sec = pick_section(_TOC_TEXT, _TOC_LIST, "12.1")
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["title"], "Статья 12.1. Одинаковая формулировка")
+        self.assertIn("тело статьи", sec["text"])
+
+    def test_pick_numeric_boundary_not_greedy(self):
+        # «Глава 1» НЕ должна матчиться на «Глава 11» — юридически разные
+        # разделы (реальный баг живого теста /section на КоАП)
+        txt = "\n".join(["Глава 11. Транспорт", "тело одиннадцать"])
+        toc = [{"title": "Глава 11. Транспорт", "level": 1}]
+        self.assertIsNone(pick_section(txt, toc, "Глава 1"))
+        sec = pick_section(txt, toc, "Глава 11")
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["title"], "Глава 11. Транспорт")
+        # а при наличии настоящей 1-й главы возвращается именно она
+        self.assertEqual(pick_section(_TOC_TEXT, _TOC_LIST, "Глава 1")["title"],
+                         "Глава 1. Задачи")
+
+    def test_pick_unknown_returns_none(self):
+        self.assertIsNone(pick_section(_TOC_TEXT, _TOC_LIST,
+                                       "Несуществующая глава 99"))
+
+    def test_empty_inputs(self):
+        self.assertEqual(slice_sections("", _TOC_LIST), [])
+        self.assertEqual(slice_sections(_TOC_TEXT, []), [])
+        self.assertIsNone(pick_section(_TOC_TEXT, [], "Глава 1"))
+        self.assertIsNone(pick_section(_TOC_TEXT, _TOC_LIST, ""))
+
+
+class TestSection(BaseCase):
+    def _seed(self):
+        A.state["session"].update(
+            query="q", category="Нормативные акты", openable=True,
+            docs=[{"index": 0, "abs": 1, "title": "КОАП",
+                   "ref": "pos:1"}])
+        self.fake.export = ("КОАП", _TOC_TEXT, [])
+        self.fake.toc = list(_TOC_LIST)
+
+    def test_returns_one_section_text(self):
+        self._seed()
+        s, j = self.post("/section", {"index": 0,
+                                      "want": "Глава 2. Ответственность"})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["section"]["text"],
+                         _TOC_TEXT.splitlines()[6] + "\n" + _TOC_TEXT.splitlines()[7])
+        self.assertEqual(j["total_sections"], 5)
+        self.assertEqual(j["matched_title"], "КОАП")
+        self.assertEqual(self.fake.toc_calls, 1)
+        self.assertFalse(A.state["session"]["openable"])   # читалка ушла с списка
+
+    def test_missing_want_honest_400(self):
+        self._seed()
+        s, j = self.post("/section", {"index": 0})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "want_required")
+        self.assertEqual(getattr(self.fake, "toc_calls", 0), 0)  # GUI не трогали
+
+    def test_unknown_section_lists_available(self):
+        self._seed()
+        s, j = self.post("/section", {"index": 0, "want": "глава 99"})
+        self.assertEqual(s, 400)
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["error"], "unknown_section")
+        self.assertFalse(j["retryable"])
+        self.assertIn("Глава 1. Задачи", j["available"])
+
+    def test_no_toc_honest(self):
+        self._seed()
+        self.fake.toc = []                                    # не структурирован
+        s, j = self.post("/section", {"index": 0, "want": "Глава 1"})
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["error"], "no_toc")
 
 
 # ---------------------------------------------------------------- /issues
