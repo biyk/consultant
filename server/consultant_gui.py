@@ -113,39 +113,95 @@ def _iter_line_offsets(text):
     return out
 
 
+def _prefix_bounded(longer, shorter):
+    """`longer` начинается с `shorter`, и сразу за префиксом — НЕ цифра.
+    Нужно, чтобы «глава 1» не матчилось на «глава 11.» (юридически разные
+    разделы; ложный анкоринг хуже честного пропуски)."""
+    if not shorter or not longer.startswith(shorter):
+        return False
+    if len(longer) == len(shorter):
+        return True
+    nxt = longer[len(shorter)]
+    return not nxt.isdigit()
+
+
+def _has_number_token(s):
+    """В строке есть номерной токен: арабская цифра или римская цифра
+    (I/II/III/IV/V/… с границей слова). Нужно для reverse-префикса,
+    чтобы случайная фраза «см. главу» не привязывалась к «Глава 12. ...».
+    Регистронезависимо: вход уже пройдёт через _norm_*, где lowercase."""
+    if not s:
+        return False
+    if any(c.isdigit() for c in s):
+        return True
+    return bool(re.search(r"(?:^|\s)(?=[IVXLCDM]{1,8}(?:\s|$|\.|,))", s, re.I))
+
+
+def _norm_line(s):
+    """Норма строки текста заголовка: убрать висячую точку-маркер конца.
+    «Глава 1. Задачи.» и «Глава 1. Задачи» должны сравниваться одинаково."""
+    s = _norm_ws(s)
+    return s.rstrip(".")
+
+
 def slice_sections(text, toc):
     """Привязать упорядоченные пункты оглавления к диапазонам символов текста.
 
     ЧИСТАЯ функция — тестируется офлайн. Каждый заголовок ищется НА НАЧАЛЕ
-    СТРОКИ (нормализуя пробелы/nbsp/регистр) и монотонно: следующий ищем не
-    раньше конца предыдущего найденного. Поэтому случайное упоминание вида
-    «…см. главу 1…» внутри чужого тела заголовком не считается. Возвращает
-    список по порядку toc: {title, level, start, end, found}; для найденных
-    end — start следующего найденного (или len(text)). start/end — индексы
-    среза text[start:end]."""
+    СТРОКИ и монотонно: следующий ищем не раньше конца предыдущего найденного.
+    Поэтому случайное упоминание вида «…см. главу 1…» внутри чужого тела
+    заголовком не считается. Возвращает список по порядку toc:
+    {title, level, start, end, found}; для найденных end — start следующего
+    найденного (или len(text)). start/end — индексы среза text[start:end].
+
+    Матчинг двусторонний с границей числа (см. _prefix_bounded): в К+ заголовок
+    в теле документа бывает КОРОЧЕ, чем в оглавлении (разрыв строки UIA, «…»
+    в конце строки toc), и наоборот. На реальном КоАПе 30/38 заголовков toc
+    длиннее своих строк в тексте («Глава 1. Задачи и принципы законодательства
+    об административных правонарушениях» vs «Глава 1. ЗАДАЧИ И ПРИНЦИПЫ
+    ЗАКОНОДАТЕЛЬСТВА»), поэтому reverse-префикс критичен. Требование
+    номерного токена (_has_number_token) в короткой стороне не даёт ложных
+    якорей для строк вида «см. также главу» / «приложение»."""
     if not text or not toc:
         return []
     lines = _iter_line_offsets(text)
-    nlines = [_norm_ws(ln) for _, ln in lines]
+    nlines = [_norm_line(ln) for _, ln in lines]
+    nlines_strip = [_norm_ws(_RE_TOC_LABEL.sub("", nl)) for nl in nlines]
     ptr, spans = 0, []
     for e in toc:
         title = e.get("title") or ""
-        key = _norm_ws(title)
+        key = _norm_line(title)
+        key_strip = _norm_ws(_RE_TOC_LABEL.sub("", key))
         found_at = None
         if key:
+            # pass 1: строгий префикс — строка текста длиннее заголовка toc
+            #           (в toc усечённая форма, в тексте полная)
+            # pass 2: reverse-префикс — заголовок toc длиннее строки текста
+            #           (обычный случай К+: toc даёт полный long-name)
+            # Оба — с границей числа и требованием номерного токена в
+            # короткой стороне.
             for li in range(ptr, len(lines)):
                 nl = nlines[li]
-                if nl and (nl == key or nl.startswith(key)):
-                    found_at = li
-                    break
-            if found_at is None:               # мягкий запасной путь: матчинг
-                strip_key = _norm_ws(_RE_TOC_LABEL.sub("", key))  # без «глава/ст.»
-                if strip_key:
-                    for li in range(ptr, len(lines)):
-                        nl = _norm_ws(_RE_TOC_LABEL.sub("", nlines[li]))
-                        if nl and (nl == strip_key or nl.startswith(strip_key)):
-                            found_at = li
-                            break
+                if not nl:
+                    continue
+                if nl == key:
+                    found_at = li; break
+                if _prefix_bounded(nl, key):
+                    found_at = li; break
+                if _prefix_bounded(key, nl) and _has_number_token(nl):
+                    found_at = li; break
+            # pass 3: снятие служебного слова («глава/ст.») с обеих сторон
+            if found_at is None and key_strip:
+                for li in range(ptr, len(lines)):
+                    nl = nlines_strip[li]
+                    if not nl:
+                        continue
+                    if nl == key_strip:
+                        found_at = li; break
+                    if _prefix_bounded(nl, key_strip):
+                        found_at = li; break
+                    if _prefix_bounded(key_strip, nl) and _has_number_token(nl):
+                        found_at = li; break
         if found_at is None:
             spans.append({"title": title, "level": e.get("level"),
                           "start": None, "end": None, "found": False})

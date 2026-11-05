@@ -16,6 +16,7 @@ from . import config
 # при подтверждённой неполноте — инвалидировать вручную через fresh.
 SEARCH_TTL = int(os.environ.get("CONSULTANT_SEARCH_TTL", "0"))
 DOC_TTL = int(os.environ.get("CONSULTANT_DOC_TTL", "0"))
+TOC_TTL = int(os.environ.get("CONSULTANT_TOC_TTL", "0"))
 
 
 def _h(*parts):
@@ -29,6 +30,12 @@ def search_key(query, category, page, page_size, sort=None):
 
 def doc_key(title):
     return _h("d", (title or "").strip())
+
+
+def toc_key(title):
+    # отдельный namespace-префикс 't', чтобы toc-хохи не сталкивались
+    # с doc-хохами для того же заголовка
+    return _h("t", (title or "").strip())
 
 
 def _read(path):
@@ -85,3 +92,22 @@ def put_doc(key, meta, content):
     with io.open(base + ".txt", "w", encoding="utf-8") as f:
         f.write(content or "")
     return base + ".json"
+
+
+def get_toc(key, ttl=None):
+    """Пункты оглавления для заголовка документа. Не завязан на text —
+    сам toc маленький, храним одним json."""
+    ttl = TOC_TTL if ttl is None else ttl
+    obj = _read(os.path.join(config.TOC_CACHE, key + ".json"))
+    if obj is None:
+        return None
+    if ttl and obj["_age"] > ttl:
+        return None
+    return obj
+
+
+def put_toc(key, meta):
+    path = os.path.join(config.TOC_CACHE, key + ".json")
+    with io.open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+    return path

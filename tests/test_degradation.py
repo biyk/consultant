@@ -189,6 +189,10 @@ class _NoCache:
         return "d"
 
     @staticmethod
+    def toc_key(*a, **k):
+        return "t"
+
+    @staticmethod
     def get_search(*a, **k):
         return None
 
@@ -197,11 +201,19 @@ class _NoCache:
         return None
 
     @staticmethod
+    def get_toc(*a, **k):
+        return None
+
+    @staticmethod
     def put_search(*a, **k):
         pass
 
     @staticmethod
     def put_doc(*a, **k):
+        pass
+
+    @staticmethod
+    def put_toc(*a, **k):
         pass
 
 
@@ -215,6 +227,7 @@ class _MemCache:
     def __init__(self):
         self.search = {}
         self.docs = {}
+        self.toc = {}
 
     @staticmethod
     def search_key(query, category, page, page_size, sort=None):
@@ -224,6 +237,10 @@ class _MemCache:
     @staticmethod
     def doc_key(title):
         return hashlib.sha1((title or "").strip().encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def toc_key(title):
+        return hashlib.sha1(("t|" + (title or "").strip()).encode("utf-8")).hexdigest()[:16]
 
     def get_search(self, key, ttl=None):
         obj = self.search.get(key)
@@ -247,6 +264,17 @@ class _MemCache:
     def put_doc(self, key, meta, content):
         self.docs[key] = {"kind": meta.get("kind"), "title": meta.get("title"),
                           "content": content, "content_len": len(content or "")}
+
+    def get_toc(self, key, ttl=None):
+        obj = self.toc.get(key)
+        if obj is None:
+            return None
+        obj = dict(obj)
+        obj["_age"] = 3.0
+        return obj
+
+    def put_toc(self, key, meta):
+        self.toc[key] = json.loads(json.dumps(meta))
 
 
 # ---------------------------------------------------------------- unit: хелперы
@@ -839,6 +867,73 @@ class TestSectionSlicing(unittest.TestCase):
         self.assertIsNone(pick_section(_TOC_TEXT, [], "Глава 1"))
         self.assertIsNone(pick_section(_TOC_TEXT, _TOC_LIST, ""))
 
+    def test_reverse_prefix_toc_longer_than_doc_heading(self):
+        # реальный КоАП: toc даёт полный long-name, а в тексте заголовок
+        # обрезан до «Глава 1. ЗАДАЧИ И ПРИНЦИПЫ ЗАКОНОДАТЕЛЬСТВА» —
+        # toc.title длиннее и начинается со строки текста: обязан анкориццо
+        txt = "\n".join([
+            "РАЗДЕЛ",
+            "Глава 1. ЗАДАЧИ И ПРИНЦИПЫ ЗАКОНОДАТЕЛЬСТВА",
+            "тело главы один",
+            "Глава 2. АДМИНИСТРАТИВНОЕ ПРАВОНАРУШЕНИЕ",
+            "тело главы два",
+        ])
+        toc = [{"title": "Глава 1. Задачи и принципы законодательства "
+                          "об административных правонарушениях", "level": 1},
+               {"title": "Глава 2. Административное правонарушение и "
+                          "административная ответственность", "level": 1}]
+        spans = slice_sections(txt, toc)
+        self.assertTrue(all(s["found"] for s in spans),
+                        "reverse-префикс обязан привязать усечённые заголовки")
+        sec = pick_section(txt, toc, "Глава 1")
+        self.assertIsNotNone(sec)
+        self.assertEqual(sec["title"], toc[0]["title"])
+        self.assertIn("тело главы один", sec["text"])
+        self.assertNotIn("тело главы два", sec["text"])
+
+    def test_reverse_prefix_roman_numeral_case_insensitive(self):
+        # «раздел iii» из toc должен привязаться к «Раздел III. …» из текста
+        # (после .lower() римские цифры тоже lowercase — нужен re.I в
+        # _has_number_token)
+        txt = "\n".join([
+            "Раздел I. ОБЩИЕ ПОЛОЖЕНИЯ",
+            " preamble",
+            "Раздел III. СУДЬИ, ОРГАНЫ, ДОЛЖНОСТНЫЕ ЛИЦА, УПОЛНОМОЧЕННЫЕ",
+            "судейский текст",
+        ])
+        toc = [{"title": "Раздел I. Общие положения", "level": 0},
+               {"title": "Раздел III. Судьи, органы, должностные лица, "
+                          "уполномоченные рассматривать дела об административных "
+                          "правонарушениях", "level": 0}]
+        spans = slice_sections(txt, toc)
+        self.assertTrue(all(s["found"] for s in spans),
+                        "Римские цифры должны матчиться регистронезависимо")
+
+    def test_reverse_prefix_requires_number_token(self):
+        # reverse-префикс опасен: «Глава» (голое служебное слово без
+        # номера) — префикс «Глава 12. …», но якорем быть НЕ должно.
+        # _has_number_token обязан отсекать такие ложные привязки.
+        txt = "\n".join(["Глава",
+                         "Глава 12. Административные правонарушения",
+                         "тело"])
+        toc = [{"title": "Глава 12. Административные правонарушения "
+                          "в области дорожного движения", "level": 1}]
+        spans = slice_sections(txt, toc)
+        self.assertTrue(spans[0]["found"])
+        first = txt[spans[0]["start"]:].splitlines()[0]
+        self.assertTrue(first.startswith("Глава 12"),
+                        "якорь обязан встать на строку с номером, "
+                        "а не на голое «Глава»: got %r" % first)
+
+    def test_reverse_prefix_numeric_boundary_still_strict(self):
+        # toc «Глава 11.» не имеет права привязаться к строке «глава 1»
+        # (reverse-префикс подчинён той же границе числа)
+        txt = "\n".join(["глава 1", "совсем другое"])
+        toc = [{"title": "Глава 11. Административные правонарушения "
+                          "на транспорте", "level": 1}]
+        spans = slice_sections(txt, toc)
+        self.assertFalse(spans[0]["found"])
+
 
 class TestSection(BaseCase):
     def _seed(self):
@@ -884,6 +979,129 @@ class TestSection(BaseCase):
         s, j = self.post("/section", {"index": 0, "want": "Глава 1"})
         self.assertFalse(j["ok"])
         self.assertEqual(j["error"], "no_toc")
+
+
+class TestCacheTocSection(BaseCase):
+    """§13.9: /toc кэшируется по заголовку строки; /section обслуживается
+    ПОЛНОСТЬЮ офлайн, когда и content, и toc уже лежат в кэше (0 GUI-звонков)."""
+
+    def _seed(self):
+        A.state["session"].update(
+            query="q", category="Нормативные акты", openable=True,
+            docs=[{"index": 0, "abs": 1, "title": "КОАП", "ref": "pos:1"}])
+        self.fake.export = ("КОАП", _TOC_TEXT, [])
+        self.fake.toc = list(_TOC_LIST)
+
+    # ---------- /toc ----------
+    def test_toc_cache_miss_stores(self):
+        A.cache_store = _MemCache()
+        self._seed()
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["count"], len(_TOC_LIST))
+        self.assertEqual(self.fake.toc_calls, 1)
+        self.assertFalse(A.state["session"]["openable"])
+
+    def test_toc_cache_hit_no_gui_and_keeps_openable(self):
+        # критично: кэш-хит /toc НЕ должен трогать GUI и НЕ должен
+        # сбрасывать openable — читалка осталась на списке
+        A.cache_store = _MemCache()
+        self._seed()
+        self.post("/toc", {"index": 0})                       # кладём кэш
+        # восстанавливаем openable, как будто это новая сессия
+        A.state["session"]["openable"] = True
+        self.fake.toc_calls = 0
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])
+        self.assertTrue(j["cached"])
+        self.assertIsNotNone(j["_age"])
+        self.assertEqual(self.fake.toc_calls, 0)              # GUI не трогали
+        self.assertTrue(A.state["session"]["openable"])       # openable не тронули
+
+    def test_toc_fresh_bypasses_cache(self):
+        A.cache_store = _MemCache()
+        self._seed()
+        self.post("/toc", {"index": 0})
+        A.state["session"]["openable"] = True
+        self.fake.toc_calls = 0
+        s, j = self.post("/toc", {"index": 0, "fresh": True})
+        self.assertEqual(self.fake.toc_calls, 1)              # fresh → живой GUI
+        self.assertFalse(j.get("cached"))
+
+    def test_toc_empty_is_not_cached(self):
+        # пустой toc — честный «не структурирован», а не «GUI не отозвался»;
+        # не кэшируем, чтобы не закреплять ложный негатив
+        A.cache_store = _MemCache()
+        self._seed()
+        self.fake.toc = []
+        s, j = self.post("/toc", {"index": 0})
+        self.assertFalse(j["has_toc"])
+        # живой /toc уводит читалку на документ → openable=False; для
+        # второго /toc нужен возврат в список (как это делает живой клиент
+        # повторным /search)
+        A.state["session"]["openable"] = True
+        self.fake.toc_calls = 0
+        s2, j2 = self.post("/toc", {"index": 0})
+        # второй вызов обязан снова дёрнуть GUI (кэш пустой)
+        self.assertEqual(self.fake.toc_calls, 1)
+        self.assertFalse(j2.get("cached"))
+
+    # ---------- /section ----------
+    def test_section_cache_hit_is_fully_offline(self):
+        # когда и content, и toc в кэше — /section обязан отшить без GUI,
+        # openable не сбрасывать, cached=true и doc_age+toc_age
+        A.cache_store = _MemCache()
+        self._seed()
+        # прогрев: /doc кладёт content, /toc кладёт entries
+        self.post("/doc", {"index": 0})
+        self.post("/toc", {"index": 0})
+        A.state["session"]["openable"] = True
+        # сбрасываем счётчик GUI-вызовов на 0
+        self.fake.toc_calls = 0
+        s, j = self.post("/section", {"index": 0, "want": "Глава 2. Ответственность"})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])
+        self.assertTrue(j["cached"])
+        self.assertIsNotNone(j["doc_age"])
+        self.assertIsNotNone(j["toc_age"])
+        self.assertEqual(j["section"]["text"],
+                         _TOC_TEXT.splitlines()[6] + "\n" + _TOC_TEXT.splitlines()[7])
+        self.assertEqual(self.fake.toc_calls, 0)              # read_toc не звался
+        self.assertTrue(A.state["session"]["openable"])       # и openable не тронули
+
+    def test_section_cache_miss_stores_both(self):
+        # холодный /section: GUI + export + read_toc; после — ОБА кэша
+        # наполнены, warm-путь работает без GUI
+        A.cache_store = _MemCache()
+        self._seed()
+        s, j = self.post("/section", {"index": 0, "want": "Глава 2. Ответственность"})
+        self.assertTrue(j["ok"])
+        self.assertFalse(j.get("cached"))
+        # кэш content + toc наполнены
+        self.assertEqual(self.fake.toc_calls, 1)
+        self.fake.toc_calls = 0
+        A.state["session"]["openable"] = True
+        s2, j2 = self.post("/section", {"index": 0, "want": "Глава 1"})
+        self.assertTrue(j2["ok"])                            # тёплый путь сработал
+        self.assertTrue(j2["cached"])
+        self.assertEqual(self.fake.toc_calls, 0)
+
+    def test_section_fresh_flag_bypasses_cache(self):
+        A.cache_store = _MemCache()
+        self._seed()
+        self.post("/doc", {"index": 0})
+        self.post("/toc", {"index": 0})
+        # после живого /toc читалка на документе; fresh /section обязан
+        # адресовать строку выдачи, поэтому возвращаем openable=True
+        A.state["session"]["openable"] = True
+        self.fake.toc_calls = 0
+        s, j = self.post("/section", {"index": 0,
+                                      "want": "Глава 2. Ответственность",
+                                      "fresh": True})
+        self.assertEqual(self.fake.toc_calls, 1)              # fresh → живой цикл
+        self.assertFalse(j.get("cached"))
 
 
 # ---------------------------------------------------------------- /issues

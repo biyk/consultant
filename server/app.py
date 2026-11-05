@@ -125,11 +125,14 @@ def manifest():
             "POST /sub": "{index | ref} -> подборка (content + entries[] с href)",
             "POST /toc": "{index | row | ref} -> оглавление документа "
                          "{toc:[{title,level}], count, has_toc} (структура "
-                         "Раздел/Глава/Статья; пусто, если не структурирован)",
+                         "Раздел/Глава/Статья; пусто, если не структурирован). "
+                         "Кэш по title: повтор без GUI; fresh=1 перечитает",
             "POST /section": "{index | row | ref, want} -> текст ОДНОГО раздела "
                              "по заголовку/номеру из /toc (want=\"Глава 4\", \"12.1\") "
                              "— чистая резка экспортированного текста по оглавлению; "
-                             "нет совпадения -> unknown_section + available[]",
+                             "нет совпадения -> unknown_section + available[]. "
+                             "Если content+toc оба в кэше — полностью офлайн, "
+                             "GUI не трогается; fresh=1 обходит кэш",
             "POST /open": "{title} | {ref} | {uri} -> прямой доступ (404, если точного совпадения нет)",
             "POST /back": "-> вверх по стеку",
             "GET/POST/PATCH /issues": "трекер заявок; GET /issues?status=open|closed|<status>"
@@ -968,6 +971,14 @@ def doc():
             hit["title_match"] = _titles_correspond(title, hit.get("title") or title)
             hit["content_charset"] = "utf-8"
             hit["mojibake_repaired"] = repaired
+            # раньше кэш-хит /doc возвращал ответ без ok/retryable/entries/links
+            # (put_doc складывал только kind/title/message/matched_title) —
+            # клиент, проверивший j["ok"], получал KeyError/None и считал
+            # успешную выдачу ошибочной. Дополняем контракт.
+            hit.setdefault("ok", True)
+            hit.setdefault("retryable", False)
+            hit.setdefault("entries", [])
+            hit.setdefault("links", [])
             return _respond(hit)
 
     def work():
@@ -1229,7 +1240,11 @@ def toc():
     Берёт строку текущей выдачи (index|row|ref, как /doc), открывает её и читает
     UIA-дерево «Оглавление документа» (кнопка «Оглавление»). Даёт навигацию по
     крупному нормативному документу без экспорта всего тела. Если структуры нет —
-    честно возвращает пустой toc с has_toc=false (не ошибка)."""
+    честно возвращает пустой toc с has_toc=false (не ошибка).
+
+    Кэш: пункты оглавления кладутся в data/toc/<sha1>.json по заголовку
+    строки выдачи; повторный /toc для того же заголовка обслуживается офлайн,
+    GUI не дёргается, сессию (openable) не трогаем. fresh=1 обходит кэш."""
     b = _body()
     sess = state["session"]
     idx, err = _resolve_row(b, sess, "/toc")
@@ -1237,9 +1252,24 @@ def toc():
         return jsonify(err[0]), err[1]
     docs = sess["docs"]
     row = docs[idx]
-    base = {"matched_index": idx, "matched_title": row.get("title") or "",
-            "index_base": 0, "abs": row.get("abs"), "ref": row.get("ref"),
+    title = row.get("title") or ""
+    base = {"matched_index": idx, "matched_title": title, "index_base": 0,
+            "abs": row.get("abs"), "ref": row.get("ref"),
             "requested": {k: b[k] for k in ("page", "index", "row", "ref") if k in b}}
+    tkey = cache_store.toc_key(title)
+    if not b.get("fresh"):
+        hit = cache_store.get_toc(tkey)
+        if hit:
+            entries = hit.get("entries") or []
+            return _respond({
+                "ok": True, "cached": True, "count": len(entries),
+                "has_toc": bool(entries), "toc": entries, **base,
+                "_age": (round(hit["_age"], 3) if hit.get("_age") is not None
+                         else None),
+                "message": (None if entries else
+                            "у этого документа оглавления нет (не структурирован)"),
+                "note": "toc из кэша (GUI не трогался); fresh=1 перечитает "
+                        "живой оглавлением"})
 
     def work():
         _ensure_gui()
@@ -1247,6 +1277,14 @@ def toc():
         entries = _gui.read_toc() or []
         # читалка осталась на документе — список больше не адресуем (как /open)
         state["session"]["openable"] = False
+        # кладём в кэш только когда структура реально прочитана (пустой toc
+        # — честный «не структурирован», а не «GUI не отозвался»: его не
+        # кэшируем, чтобы не закреплять ложный негатив)
+        if entries:
+            try:
+                cache_store.put_toc(tkey, {"title": title, "entries": entries})
+            except OSError:
+                pass
         return {"ok": True, "count": len(entries), "has_toc": bool(entries),
                 "toc": entries, **base,
                 "message": (None if entries else
@@ -1272,9 +1310,13 @@ def section():
     текст (путь /doc) и читаем оглавление (путь /toc), затем ЧИСТО (pure-
     функция slice_sections/pick_section) режем текст по заголовкам и отдаём тело
     запрошенного раздела want (например {want: "Глава 4"} или "12.1").
-    Офлайн-зонд: на реальном КоАП 38/38 пунктов /toc встречаются в тексте /doc.
     want не найден среди заголовков — честный unknown_section с available[]
-    (текст НЕ выдумываем)."""
+    (текст НЕ выдумываем).
+
+    Кэш: если content (/doc) и toc (/toc) уже лежат в data/{docs,toc}/ —
+    /section обслуживается ПОЛНОСТЬЮ офлайн, GUI не трогается вовсе,
+    openable не сбрасывается. Иначе делаем живой цикл export+read_toc и
+    кладём ОБА кэша. fresh=1 обходит кэш."""
     b = _body()
     sess = state["session"]
     idx, err = _resolve_row(b, sess, "/section")
@@ -1293,44 +1335,56 @@ def section():
                                   "раздела из /toc (например \"Глава 4\", \"12.1\")",
                         **base}), 400
     dkey = cache_store.doc_key(title)
+    tkey = cache_store.toc_key(title)
+
+    # --- тёплый путь: content + toc уже в кэше → режем офлайн, GUI spiшем ---
+    if not b.get("fresh"):
+        doc_hit = cache_store.get_doc(dkey)
+        toc_hit = cache_store.get_toc(tkey)
+        if doc_hit and toc_hit:
+            text = doc_hit.get("content") or ""
+            entries = toc_hit.get("entries") or []
+            return _respond(_section_result(text, entries, want, base,
+                                           doc_age=doc_hit.get("_age"),
+                                           toc_age=toc_hit.get("_age"),
+                                           cached=True))
 
     def work():
         _ensure_gui()
         abs_i = row["abs"]
         _gui.ensure_doc_open(abs_i)
         text = ""
+        opened_title = title
         for _attempt in range(3):
             _gui.goto_doc_index(abs_i)
             _t, text, _links = _gui.export_current_doc(dkey)
             if text and len(text) > config.DOC_MIN_CONTENT:
+                opened_title = _t or title
                 break
             time.sleep(0.6)
         entries = _gui.read_toc() or []
         # читалка увела с списка — дальше только повторный /search (как /toc)
         state["session"]["openable"] = False
         text, repaired = _prep_text(text)
-        spans = [s for s in slice_sections(text, entries) if s["found"]]
-        if not text or len(text) <= config.DOC_MIN_CONTENT:
-            return {"ok": False, "error": "doc_unavailable", "retryable": True,
-                    "toc_total": len(entries), "toc_found": len(spans), **base,
-                    "message": "doc_unavailable: экспорт пуст/обрезан — повтори /section"}
-        if not entries:
-            return {"ok": False, "error": "no_toc", "retryable": False, **base,
-                    "message": "у этого документа оглавления нет — он не "
-                               "структурирован; текст целиком бери /doc"}
-        sec = pick_section(text, entries, want)
-        if sec is None:
-            return {"ok": False, "error": "unknown_section", "retryable": False,
-                    "toc_total": len(entries), "toc_found": len(spans),
-                    "available": [s["title"] for s in spans], "_status": 400, **base,
-                    "message": "section_not_found: %r не совпало ни с одним "
-                               "заголовком оглавления — выбери из available "
-                               "(или сходи в /toc)" % want}
-        return {"ok": True, "section": sec, "content_charset": "utf-8",
-                "mojibake_repaired": repaired, "toc_total": len(entries),
-                "toc_found": len(spans), "total_sections": len(spans), **base,
-                "note": "section.text = тело раздела от его заголовка до "
-                        "следующего заголовка оглавления (чистая резка текста)"}
+        # кладём в кэш только успешный результат (text достаточен + структура
+        # есть); иначе не закрепляем ложный негатив и не кэшируем обрезанный экспорт
+        if text and len(text) > config.DOC_MIN_CONTENT:
+            try:
+                cache_store.put_doc(dkey, {"kind": "document",
+                                           "title": opened_title,
+                                           "message": None,
+                                           "matched_title": title}, text)
+            except OSError:
+                pass
+        if entries:
+            try:
+                cache_store.put_toc(tkey, {"title": opened_title,
+                                            "entries": entries})
+            except OSError:
+                pass
+        return _section_result(text, entries, want, base,
+                               doc_age=None, toc_age=None, cached=False,
+                               repaired=repaired)
 
     try:
         return _respond(gui_call("/section", work))
@@ -1339,6 +1393,40 @@ def section():
     except GuiError as e:
         return jsonify({"ok": False, "error": "gui_error", "detail": str(e),
                         "retryable": True, **base}), 502
+
+
+def _section_result(text, entries, want, base, doc_age, toc_age, cached,
+                    repaired=None):
+    """Собрать ответ /section из content+toc (общий путь для кэш-хита и
+    живого GUI-результата). text уже должен быть после _prep_text."""
+    spans = [s for s in slice_sections(text, entries) if s["found"]]
+    if not text or len(text) <= config.DOC_MIN_CONTENT:
+        return {"ok": False, "error": "doc_unavailable", "retryable": True,
+                "toc_total": len(entries), "toc_found": len(spans), **base,
+                "message": "doc_unavailable: экспорт пуст/обрезан — повтори /section"}
+    if not entries:
+        return {"ok": False, "error": "no_toc", "retryable": False, **base,
+                "message": "у этого документа оглавления нет — он не "
+                           "структурирован; текст целиком бери /doc"}
+    sec = pick_section(text, entries, want)
+    if sec is None:
+        return {"ok": False, "error": "unknown_section", "retryable": False,
+                "toc_total": len(entries), "toc_found": len(spans),
+                "available": [s["title"] for s in spans], "_status": 400, **base,
+                "message": "section_not_found: %r не совпало ни с одним "
+                           "заголовком оглавления — выбери из available "
+                           "(или сходи в /toc)" % want}
+    out = {"ok": True, "section": sec, "content_charset": "utf-8",
+           "toc_total": len(entries), "toc_found": len(spans),
+           "total_sections": len(spans), "cached": bool(cached), **base,
+           "note": "section.text = тело раздела от его заголовка до "
+                   "следующего заголовка оглавления (чистая резка текста)"}
+    if cached:
+        out["doc_age"] = (round(doc_age, 3) if doc_age is not None else None)
+        out["toc_age"] = (round(toc_age, 3) if toc_age is not None else None)
+    if repaired is not None:
+        out["mojibake_repaired"] = repaired
+    return out
 
 
 @app.post("/back")

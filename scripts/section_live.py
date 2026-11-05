@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """Живая проверка /section на реальном клиенте К+ (GUI держит сервер).
 
-Четыре сценария, каждый со СВЕЖИМ /search (после /section читалка уходит с выдачи,
-openable=False — поэтому выдачу каждый раз перезасеваем):
+Семь сценариев, первые четыре со СВЕЖИМ /search (после /section читалка
+уходит с выдачи, openable=False — поэтому выдачу каждый раз перезасеваем):
   a) позитив: берём реальный заголовок из available[] -> ok, отдаёт тело раздела;
   b) граница номера: want «Глава 1» НЕ должен вернуть «Глава 11 …»;
   c) nonexistent want («глава 999999»)   -> честный 400 unknown_section + available[];
-  d) без want                            -> честный 400 want_required.
+  d) без want                            -> честный 400 want_required;
+  e) анкоринг: available[] должен включать большинство пунктов toc (>=80%);
+  f) /toc кэш: второй /toc по тому же title -> cached=true, GUI не дёргается;
+  g) /section кэш: после прогрева content+toc -> /section полностью офлайн
+     (cached=true, doc_age+toc_age есть).
 В конце /health — убедиться, что GUI жив и не завис.
 
 Запуск: venv\\Scripts\\python.exe scripts\\section_live.py
@@ -104,13 +108,54 @@ def main():
     d_ok = st == 400 and j.get("error") == "want_required"
     print("\nd) без want -> HTTP %s error=%s" % (st, j.get("error")))
 
+    # e) глубина анкоринга: toc_found/toc_total обязан быть >= 80%
+    #    (до фикса было 8/38=21%; после bidirectional-префикса 38/38=100%
+    #    на реальном КоАП. Не ниже 80% — регресс).
+    idx, _ = seed_row()
+    st, j = call("/section", {"index": idx, "want": "zzz"})
+    total = j.get("toc_total") or 0
+    found = j.get("toc_found") or 0
+    e_ok = bool(total) and (found / max(total, 1)) >= 0.80
+    print("\ne) anchoring: toc_found=%s / toc_total=%s = %s%% (порог 80%%) -> e_ok=%s"
+          % (found, total, round(100.0 * found / max(total, 1)), e_ok))
+
+    # f) /toc кэш: warm-up холодным /search -> /toc кладёт entries в кэш,
+    #    затем повтор /search (возвращает openable) и второй /toc обязан
+    #    прийти cached=true, GUI не трогается, openable остаётся True.
+    idx, _ = seed_row()
+    st1, j1 = call("/toc", {"index": idx})
+    if j1.get("cached"):
+        # уже прогрето предыдущим прогоном — ок
+        pass
+    idx, _ = seed_row()
+    st2, j2 = call("/toc", {"index": idx})
+    f_ok = bool(j2.get("cached")) and j2.get("count", 0) == j1.get("count", 0)
+    print("\nf) /toc кэш: 1st cached=%s count=%s; 2nd cached=%s count=%s -> f_ok=%s"
+          % (j1.get("cached"), j1.get("count"),
+             j2.get("cached"), j2.get("count"), f_ok))
+
+    # g) /section тёплый путь: после /doc (прошлые прогоны) + /toc — cached=true
+    #    и doc_age/toc_age заполнены
+    idx, _ = seed_row()
+    st3, j3 = call("/doc", {"index": idx})         # кладёт doc cache
+    idx, _ = seed_row()
+    st4, j4 = call("/toc", {"index": idx})         # кладёт toc cache
+    idx, _ = seed_row()
+    st5, j5 = call("/section", {"index": idx, "want": pick})
+    g_ok = bool(j5.get("cached")) and j5.get("doc_age") is not None \
+        and j5.get("toc_age") is not None
+    print("\ng) /section кэш: cached=%s doc_age=%s toc_age=%s ok=%s -> g_ok=%s"
+          % (j5.get("cached"), j5.get("doc_age"), j5.get("toc_age"),
+             j5.get("ok"), g_ok))
+
     h = health()
     print("\n/health ok=%s window=%r tabs=%s" %
           (h.get("ok"), (h.get("gui") or {}).get("window"), (h.get("gui") or {}).get("tabs")))
 
-    verdict = all([a_ok, b_ok, c_ok, d_ok, bool(h.get("ok"))])
-    print("\n=== ИТОГ: a=%s b=%s c=%s d=%s health=%s -> %s ===" %
-          (a_ok, b_ok, c_ok, d_ok, h.get("ok"), "PASS" if verdict else "FAIL"))
+    verdict = all([a_ok, b_ok, c_ok, d_ok, e_ok, f_ok, g_ok, bool(h.get("ok"))])
+    print("\n=== ИТОГ: a=%s b=%s c=%s d=%s e=%s f=%s g=%s health=%s -> %s ===" %
+          (a_ok, b_ok, c_ok, d_ok, e_ok, f_ok, g_ok, h.get("ok"),
+           "PASS" if verdict else "FAIL"))
     return 0 if verdict else 1
 
 

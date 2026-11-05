@@ -12,11 +12,13 @@ SERVER_DIR = os.path.join(PROJECT_DIR, "server")
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 SEARCH_CACHE = os.path.join(DATA_DIR, "search")
 DOCS_CACHE = os.path.join(DATA_DIR, "docs")
+TOC_CACHE = os.path.join(DATA_DIR, "toc")
 RTF_INBOX = os.path.join(DATA_DIR, "rtf_inbox")
 ISSUES_DIR = os.path.join(DATA_DIR, "issues")
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 
-for _d in (DATA_DIR, SEARCH_CACHE, DOCS_CACHE, RTF_INBOX, ISSUES_DIR, LOGS_DIR):
+for _d in (DATA_DIR, SEARCH_CACHE, DOCS_CACHE, TOC_CACHE, RTF_INBOX, ISSUES_DIR,
+           LOGS_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # --- Клиент КонсультантПлюс -------------------------------------------------
