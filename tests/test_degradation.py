@@ -40,6 +40,12 @@ class FakeGUI:
         self.enum_calls = 0
         # имитация «список не отрисовался с первого раза, со второй — отрисовался»
         self.fail_first_enumeration = False
+        # параметры перечисления, чтобы проверять, что объём раздела реально
+        # передаётся в GUI (issue e7f7bb098cfd)
+        self.enum_args = []
+        # True = вести как живой ConsultantGUI: при несовпадении объёма
+        # читалки с разделом заголовки не отдавать
+        self.honor_expect_total = False
 
     # подключение/окно
     def connect(self, timeout=30):
@@ -100,10 +106,14 @@ class FakeGUI:
         return True
 
     # выдача
-    def enumerate_titles(self, start_abs, count):
+    def enumerate_titles(self, start_abs, count, query_flat=None, expect_total=None):
         self.enum_calls += 1
+        self.enum_args.append({"start_abs": start_abs, "count": count,
+                               "query_flat": query_flat, "expect_total": expect_total})
         if self.fail_first_enumeration and self.enum_calls == 1:
             return []
+        if self.honor_expect_total and expect_total and self.pos[1] != expect_total:
+            return []          # листаем НЕ список этого запроса — пусто
         return list(self.titles)
 
     def _doc_position(self):
@@ -136,7 +146,8 @@ class BaseCase(unittest.TestCase):
         A.cache_store = _NoCache()
         # чистое состояние сессии
         A.state["session"].update(query=None, category=None, total=None, docs=[],
-                                  categories=[], openable=False, from_cache=False)
+                                  categories=[], openable=False, from_cache=False,
+                                  section_count=None)
         A.state["known_categories"] = list(config.CANONICAL_CATEGORIES)
         A.state["ref_titles"] = {}
         A.state["last_live"] = {}
@@ -189,6 +200,7 @@ class _NoCache:
 
 
 import hashlib
+from unittest import mock
 
 
 class _MemCache:
@@ -811,10 +823,10 @@ class TestLeakGuards(BaseCase):
         self.assertIn("Жилищный кодекс Российской Федерации", titles)
 
     def test_partial_list_is_marked_truncated(self):
-        # живой кейс 04.11.2026: total=38, page_size=3, а перечиталась 1 строка —
-        # раньше это уходило как truncated=false
-        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 2509)]
-        self.fake.titles = [(1, "Обзор: " + "практика ВС РФ N 1 (2026)")]
+        # список прочитан оборванно, но ОБЪЁМ читалки совпадает с разделом —
+        # это именно «прочитано частично», а не «листим не тот список»
+        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 38)]
+        self.fake.titles = [(1, "Обзор: практика ВС РФ N 1 (2026)")]
         self.fake.pos = (1, 38)
         s, j = self.post("/search", {"query": "обзор практики", "page_size": 3,
                                      "fresh": True})
@@ -823,6 +835,7 @@ class TestLeakGuards(BaseCase):
         self.assertEqual(j["parsed_count"], 1)
         self.assertEqual(j["expected_count"], 3)
         self.assertIn("прочитан частично", j["note"])
+        self.assertIsNone(j["scope_mismatch"])
 
     def test_rows_identical_is_not_success(self):
         # issue 5607db8a1c12: дублирование одной строки masquerade под успех
@@ -835,6 +848,146 @@ class TestLeakGuards(BaseCase):
         self.assertFalse(j["ok"])
         self.assertTrue(j["rows_identical"])
         self.assertEqual(j["empty_reason"], "list_not_rendered")
+
+
+# ------------------------------------------------- сверка ОБЪЁМА списка
+# (issues e7f7bb098cfd, e15c0d424393)
+class TestListScopeMismatch(BaseCase):
+    """Живой прогон 05.11.2026: /search отдал 5 заголовков блока «Последние
+    открытые документы» как выдачу запроса, потому что двойной клик по (900,300)
+    ничего не открыл, а перечисление поехало листать уже открытый СТАРЫЙ
+    документ: читалка показывала «Док.5/31» при разделе в 1588 документов.
+    Ложный успех для юридической цитаты хуже честного отказа — такое больше
+    не должно уходить как ok=true."""
+
+    def _stale_reader(self):
+        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 1588)]
+        self.fake.titles = [(1, "Обзор: ВС РФ обобщил позиции судов"),
+                            (2, "Приказ ФНС от 01.02.2024 N 10-н")]
+        self.fake.pos = (5, 31)      # объём ЧУЖОГО списка, а не раздела
+
+    def test_search_refuses_foreign_list(self):
+        self._stale_reader()
+        s, j = self.post("/search", {"query": "ключевая ставка", "page_size": 2,
+                                     "fresh": True})
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["empty_reason"], "list_scope_mismatch")
+        self.assertEqual(j["error"], "list_scope_mismatch")
+        self.assertEqual(j["docs"], [])
+        self.assertEqual(j["parsed_count"], 0)
+        self.assertTrue(j["retryable"])
+        self.assertIsNone(j["total"])
+        self.assertEqual(j["section_count"], 1588)
+        self.assertEqual(j["scope_mismatch"],
+                         {"opened_list_total": 31, "section_count": 1588,
+                          "section": "Российское законодательство (Версия Проф)"})
+        self.assertIn("открытый список содержит 31", j["note"])
+        self.assertIn("1588", j["note"])
+        self.assertFalse(j["openable"])
+        # и сессия не оставляется адресной: /doc по такой «выдаче» честно 400
+        self.assertEqual(A.state["session"]["docs"], [])
+        s2, j2 = self.post("/doc", {"index": 0})
+        self.assertEqual(s2, 400)
+        self.assertEqual(j2["error"], "no_openable_list")
+
+    def test_scope_mismatch_beats_list_not_rendered(self):
+        # сам GUI отказался отдавать чужие заголовки ([]), но причину надо
+        # назвать точную: не «строки не отрендерились», а «листим не тот список»
+        self._stale_reader()
+        self.fake.honor_expect_total = True
+        s, j = self.post("/search", {"query": "ключевая ставка", "page_size": 2,
+                                     "fresh": True})
+        self.assertEqual(j["empty_reason"], "list_scope_mismatch")
+        self.assertNotIn("не отрендерились", j["note"])
+        self.assertEqual(j["enum_attempts"], 2)     # вторая попытка была
+
+    def test_expect_total_is_passed_to_gui(self):
+        # без этого аргумента проверка объёма осталась бы только на нашей стороне
+        self._stale_reader()
+        self.post("/search", {"query": "ключевая ставка", "page_size": 2,
+                              "fresh": True})
+        self.assertEqual(self.fake.enum_args[0]["expect_total"], 1588)
+        self.assertTrue(self.fake.enum_args[0]["query_flat"])   # запрос тоже ушёл
+
+    def test_matching_volume_is_success(self):
+        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 1588)]
+        self.fake.titles = [(1, "Документ первый"), (2, "Документ второй")]
+        self.fake.pos = (2, 1588)      # ровно объём выбранного раздела
+        s, j = self.post("/search", {"query": "ключевая ставка", "page_size": 2,
+                                     "fresh": True})
+        self.assertTrue(j["ok"])
+        self.assertIsNone(j["scope_mismatch"])
+        self.assertEqual(j["total"], 1588)
+
+    def test_approximate_section_count_allows_bigger_reader_total(self):
+        # «≥1588» — точного числа нет, поэтому требуем только total >= section
+        self.fake.cats = [{"name": "Российское законодательство (Версия Проф)",
+                           "count": 1588, "raw_count": "\u22651588", "leaf": True}]
+        self.fake.titles = [(1, "Документ первый")]
+        self.fake.pos = (1, 2000)
+        s, j = self.post("/search", {"query": "ключевая ставка", "fresh": True})
+        self.assertTrue(j["ok"])
+        self.assertIsNone(j["scope_mismatch"])
+        self.assertIsNone(self.fake.enum_args[0]["expect_total"])  # сверку делает app
+
+    def test_approximate_section_still_refuses_smaller_list(self):
+        self.fake.cats = [{"name": "Российское законодательство (Версия Проф)",
+                           "count": 1588, "raw_count": "\u22651588", "leaf": True}]
+        self.fake.titles = [(1, "Документ первый")]
+        self.fake.pos = (5, 31)        # меньше раздела — это точно чужой список
+        s, j = self.post("/search", {"query": "ключевая ставка", "fresh": True})
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["empty_reason"], "list_scope_mismatch")
+        self.assertEqual(j["scope_mismatch"]["opened_list_total"], 31)
+
+    def test_total_unreadable_is_not_scope_mismatch(self):
+        # «Док.N/total» не прочитался → объём сверить нечем, прежняя причина
+        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 1588)]
+        self.fake.titles = [(1, "Документ первый")]
+        self.fake.pos = (1, None)
+        s, j = self.post("/search", {"query": "ключевая ставка", "fresh": True})
+        self.assertTrue(j["ok"])
+        self.assertIsNone(j["scope_mismatch"])
+        self.assertIsNone(j["total"])
+
+    def test_page_refuses_foreign_list(self):
+        # успешная выдача, а потом /page ушёл в чужой список — строки не отдаём,
+        # сессию не троем
+        self.fake.cats = [_cat("Судебная практика", 12)]
+        self.fake.titles = [(1, "Док один"), (2, "Док два")]
+        self.fake.pos = (2, 12)
+        s, j = self.post("/search", {"query": "док", "page_size": 2, "fresh": True})
+        self.assertTrue(j["ok"])
+        self.assertEqual(A.state["session"]["section_count"], 12)
+        self.fake.pos = (5, 31)
+        s2, j2 = self.post("/page", {"page": 2})
+        self.assertFalse(j2["ok"])
+        self.assertEqual(j2["error"], "list_scope_mismatch")
+        self.assertEqual(j2["docs"], [])
+        self.assertEqual(j2["scope_mismatch"]["opened_list_total"], 31)
+        self.assertEqual(j2["scope_mismatch"]["section_count"], 12)
+        self.assertIn("не выдача запроса", j2["note"])
+        self.assertEqual(len(A.state["session"]["docs"]), 2)   # прежняя выдача цела
+
+    def test_open_refuses_foreign_list(self):
+        # /open берёт строки только из списка этого запроса: candidates и
+        # «найденный документ» не должны приезжать из старой вкладки
+        self.fake.cats = [_cat("Российское законодательство (Версия Проф)", 1588)]
+        self.fake.titles = [(1, "Обзор: ВС РФ обобщил позиции судов")]
+        self.fake.pos = (1, 31)
+        self.fake.honor_expect_total = True
+        s, j = self.post("/open", {"title": "Обзор: ВС РФ обобщил позиции судов"})
+        self.assertEqual(s, 404)
+        self.assertEqual(j["error"], "doc_not_found")
+        self.assertEqual(j["candidates"], [])
+        self.assertNotIn("content", j)
+
+    def test_manifest_declares_new_reason(self):
+        # контракт: новый empty_reason обязан быть перечислен в манифесте,
+        # иначе клиент не знает, как его трактовать
+        s, j = self.get("/")
+        self.assertIn("list_scope_mismatch", j["notes"]["empty_reason"])
+        self.assertIn("list_scope_mismatch", j["notes"]["empty_reason_semantics"])
 
 
 # ------------------------------------------------- точность /open
@@ -1007,6 +1160,244 @@ class TestGuiCategories(unittest.TestCase):
         self.assertEqual(names, ["Судебная практика", "Арбитражные суды"])
         self.assertEqual(cats[0]["count"], 123)
         self.assertFalse(any("(Искать)" in n for n in names))
+
+
+class TestDocPosition(unittest.TestCase):
+    """ статус-бар К+ содержит ДВА счётчика: «Док. N /M» (документ в списке)
+    и «Абз. K /L» (абзац во всём результате). Прежний парсер брал последнее
+    «/число» и возвращал число АБЗАЦЕВ вместо объёма списка — из-за этого
+    сверка объёма была невозможна (issues e7f7bb098cfd, e15c0d424393)."""
+
+    def _gui(self, names):
+        """names — [(left, имя)] в порядке обхода окна."""
+        edits = [_El(name=nm, rect=_Rect(l, 1049, l + 50, 1070))
+                 for l, nm in names]
+        return _bare_gui(_descendants=lambda control_type=None, **kw: edits)
+
+    BAR = [(700, "Док.\xa03"), (752, "/1588"), (806, "Абз.\xa02668"), (885, "/10061")]
+
+    def test_doc_pair_not_paragraph_total(self):
+        g = self._gui(self.BAR)
+        self.assertEqual(g._doc_position(), (3, 1588))
+
+    def test_order_independent(self):
+        # абзацная пара в обходе раньше документной — геометрия спасает
+        g = self._gui([(806, "Абз.\xa02668"), (885, "/10061"),
+                       (700, "Док.\xa03"), (752, "/1588")])
+        self.assertEqual(g._doc_position(), (3, 1588))
+
+    def test_without_paragraph_counter(self):
+        g = self._gui([(700, "Док.\xa01"), (752, "/90")])
+        self.assertEqual(g._doc_position(), (1, 90))
+
+    def test_no_doc_counter(self):
+        # счётчика «Док.» нет (не на списке) — прежний запасной путь
+        g = self._gui([(806, "Абз.\xa02668"), (885, "/10061")])
+        self.assertEqual(g._doc_position(), (None, 10061))
+
+    def test_empty_status_bar(self):
+        g = self._gui([(700, "Результаты поиска")])
+        self.assertEqual(g._doc_position(), (None, None))
+
+    def test_title_is_the_changing_edit_not_band_header(self):
+        # заголовок документа (top=179) важнее полосы раздела (top=191)
+        edits = [_El(name="Российское законодательство (Версия Проф",
+                     rect=_Rect(300, 191, 792, 215)),
+                 _El(name='"Основные направления единой денежно-кредитной политики"',
+                     rect=_Rect(300, 179, 1378, 203))]
+        g = _bare_gui(_descendants=lambda control_type=None, **kw: edits,
+                      _w=lambda e: e.width(),
+                      _state_suffix=lambda: "Поиск: ключевая ставка")
+        self.assertIn("Основные направления", g._doc_title("ключевая ставка"))
+
+
+class _Rect:
+    """Как rectangle() у pywinauto: границы + width()/height()."""
+
+    def __init__(self, left, top, right, bottom):
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+    def width(self):
+        return self.right - self.left
+
+    def height(self):
+        return self.bottom - self.top
+
+
+class _El:
+    """Мини-обёртка элемента UIA (element_info + rectangle) — без окна."""
+
+    def __init__(self, name="", aid="", cls="", rect=None):
+        self.element_info = type("I", (), {"name": name, "automation_id": aid,
+                                          "class_name": cls})()
+        self._rect = rect or _Rect(0, 0, 0, 0)
+
+    def rectangle(self):
+        return self._rect
+
+    def width(self):
+        return self._rect.width()
+
+
+def _bare_gui(**overrides):
+    """ConsultantGUI без подключения к окну: подставляем только то, что зовём."""
+    from server.consultant_gui import ConsultantGUI
+    g = ConsultantGUI.__new__(ConsultantGUI)
+    for k, v in overrides.items():
+        setattr(g, k, v)
+    return g
+
+
+class TestGuiTitleEcho(unittest.TestCase):
+    """_doc_title обязан отличать заголовок документа от ЭХА запроса
+    (issue e7f7bb098cfd: на пустой читалке выдача была «запрос ×N»)."""
+
+    Q = "обзор судебной практики верховный суд"
+
+    def _gui(self, edits):
+        return _bare_gui(_descendants=lambda control_type=None, **kw: edits,
+                         _w=lambda e: e.width(),
+                         _state_suffix=lambda: "Поиск: " + self.Q)
+
+    def test_norm_title_ignores_quotes_nbsp_case(self):
+        from server.consultant_gui import _norm_title
+        self.assertEqual(_norm_title("\u00abОбзор\xa0судебной  практики\u00bb"),
+                         "обзор судебной практики")
+        self.assertEqual(_norm_title('"обзор судебной практики"'),
+                         _norm_title("обзор судебной практики"))
+        self.assertEqual(_norm_title(None), "")
+
+    def test_search_field_by_aid_is_never_a_title(self):
+        # широкие поля поиска (aid 1001/1063) — не заголовок, даже с текстом
+        edits = [_El(name=self.Q, aid=config.AID_SEARCH_EDIT2,
+                     rect=_Rect(300, 210, 1352, 240)),
+                 _El(name="Обзор: ВС РФ обобщил позиции судов", aid="",
+                     rect=_Rect(300, 260, 900, 290))]
+        g = self._gui(edits)
+        self.assertEqual(g._doc_title(self.Q), "Обзор: ВС РФ обобщил позиции судов")
+
+    def test_echo_without_known_aid_is_skipped(self):
+        # эхо может лежать в Edit с НЕИЗВЕСТНЫМ aid (колоночный чип) —
+        # спасает только сравнение с нормализованным запросом
+        edits = [_El(name='"%s"' % self.Q, aid="7777",
+                     rect=_Rect(300, 210, 1352, 240))]
+        g = self._gui(edits)
+        self.assertEqual(g._doc_title(self.Q), "")     # fallback: состояние = «Поиск:» → пусто
+        # без query_flat та же строка прошла бы как «заголовок» — вот и источник
+        # «выдачи из одного и того же текста»
+        self.assertEqual(g._doc_title(), '"%s"' % self.Q)
+
+    def test_title_with_query_inside_still_dropped(self):
+        # «обзор судебной практики верховный суд» внутри длинного заголовка-эха
+        edits = [_El(name=self.Q + " (КонсультантПлюс, 2026)", aid="8888",
+                     rect=_Rect(300, 210, 1352, 240))]
+        self.assertEqual(self._gui(edits)._doc_title(self.Q), "")
+
+
+class TestGuiOpenFirstDoc(unittest.TestCase):
+    """Открытие строки списка (issues e15c0d424393, e7f7bb098cfd): кликаем по
+    ОБЛАСТИ списка, а не по жёстким координатам, и верим, что клик реально
+    что-то открыл."""
+
+    PANE = _Rect(290, 268, 1872, 900)      # внутренняя область контента
+
+    def _gui(self, pane=None, clicks=None, open_after=None, stale=None):
+        """Читалка: stale — какой (cur,total) показывает ВСЕГДА (залипший
+        список); open_after — сколько кликов нужно, чтобы список открылся."""
+        if clicks is None:
+            clicks = []
+        state = {"backs": 0}
+
+        def doc_position():
+            if stale is not None:
+                return stale
+            if open_after is not None and len(clicks) >= open_after:
+                return (1, 1588)
+            return (None, None)
+
+        def click(coords=None, double=False, **kw):
+            clicks.append(coords)
+
+        g = _bare_gui(ensure_window=lambda: None,
+                      _doc_position=doc_position,
+                      go_back=lambda: state.__setitem__("backs", state["backs"] + 1),
+                      list_pane_rect=lambda: pane,
+                      win=type("W", (), {"click_input":
+                                         lambda self, **kw: click(**kw)})(),
+                      _state_suffix=lambda: "Поиск: ключевая ставка")
+        g.state = state
+        return g
+
+    def test_clicks_are_inside_list_pane(self):
+        clicks = []
+        # читалка закрыта; список открывается со второго клика по области
+        g = self._gui(pane=self.PANE, clicks=clicks, open_after=2)
+        with mock.patch("time.sleep"):
+            self.assertTrue(g.open_first_doc())
+        self.assertEqual(len(clicks), 2)
+        for (x, y) in clicks:
+            self.assertTrue(self.PANE.left <= x <= self.PANE.right,
+                            "клик %s вне области списка" % ((x, y),))
+            self.assertTrue(self.PANE.top <= y <= self.PANE.bottom)
+        self.assertNotIn((900, 300), clicks)      # жёсткая точка больше не первая
+
+    def test_hardcoded_point_is_only_last_fallback(self):
+        clicks = []
+        # ничего не открывается → уходим с False, а не с «успехом»
+        g = self._gui(pane=self.PANE, clicks=clicks, stale=(5, 31))
+        with mock.patch("time.sleep"):
+            self.assertFalse(g.open_first_doc())
+        self.assertEqual(clicks[-1], (900, 300))
+        self.assertEqual(g.state["backs"], 2)     # из читалки вышли («Назад»)
+
+    def test_no_pane_falls_back_to_old_point(self):
+        clicks = []
+        g = self._gui(pane=None, clicks=clicks, open_after=1)
+        with mock.patch("time.sleep"):
+            self.assertTrue(g.open_first_doc())
+        self.assertEqual(clicks, [(900, 300)])
+
+    def test_enumerate_returns_empty_when_open_failed(self):
+        # ключевая гарантия: без подтверждённого открытия строки заголовки
+        # НЕ собираются — иначе отдадим список старой вкладки за выдачу
+        clicks = []
+        g = self._gui(pane=self.PANE, clicks=clicks, open_after=None)
+        g.goto_doc_index = lambda n: True
+        g._doc_title = lambda qf=None: "КАКОЙ-ТО ЗАГОЛОВОК"
+        g.next_doc = lambda: True
+        with mock.patch("time.sleep"):
+            out = g.enumerate_titles(1, 3, "ключевая ставка", expect_total=1588)
+        self.assertEqual(out, [])
+
+    def test_enumerate_drops_foreign_volume(self):
+        # читалка листает список в 31 документ при разделе в 1588 → пусто
+        g = self._gui(pane=self.PANE, clicks=[], stale=(1, 31))
+        g.goto_doc_index = lambda n: True
+        g._doc_title = lambda qf=None: "Обзор: ВС РФ"
+        g.next_doc = lambda: True
+        out = g.enumerate_titles(1, 3, "ключевая ставка", expect_total=1588)
+        self.assertEqual(out, [])
+
+    def test_enumerate_keeps_matching_volume(self):
+        cur = {"n": 1}
+        g = _bare_gui(ensure_window=lambda: None,
+                      _doc_position=lambda: (cur["n"], 1588),
+                      goto_doc_index=lambda n: True,
+                      next_doc=lambda: (cur.__setitem__("n", cur["n"] + 1), True)[1],
+                      _doc_title=lambda qf=None: "Документ",
+                      _state_suffix=lambda: "Поиск: ключевая ставка")
+        out = g.enumerate_titles(1, 3, "ключевая ставка", expect_total=1588)
+        self.assertEqual([ab for ab, _t in out], [1, 2, 3])
+
+    def test_list_pane_picks_inner_content_area(self):
+        els = [_El(name="", cls="QWidget", rect=_Rect(0, 0, 1920, 1080)),   # top<230 → нет
+               _El(name="", cls="MDIClient", rect=_Rect(0, 240, 1900, 1050)),
+               _El(name="Рабочая область", cls="Afx:1", rect=_Rect(0, 240, 1900, 1050)),
+               _El(name="", cls="Afx:2", rect=_Rect(290, 268, 1872, 900)),
+               _El(name="", cls="Afx:3", rect=_Rect(290, 268, 1872, 339))]  # полоса-заголовок
+        g = _bare_gui(_descendants=lambda control_type=None, **kw: els)
+        r = g.list_pane_rect()
+        self.assertEqual((r.left, r.top, r.right, r.bottom), (290, 268, 1872, 900))
 
 
 if __name__ == "__main__":

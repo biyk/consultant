@@ -64,6 +64,7 @@ def step(title, method, path, body=None, checks=()):
                      " | " + "; ".join(verdict))
     keys = ("ok", "error", "empty_reason", "total", "total_source", "pages",
             "selected_category", "selection_rule", "requested_category",
+            "section_count", "scope_mismatch",
             "parsed_count", "expected_count", "truncated", "enum_attempts",
             "exact_match", "title_match", "matched_index",
             "matched_title", "content_len", "content_charset",
@@ -87,6 +88,21 @@ def step(title, method, path, body=None, checks=()):
 C = lambda k, v: (k, lambda j, k=k, v=v: j.get(k) == v)          # noqa: E731
 D = lambda k: (k, lambda j, k=k: j.get(k) is not None)            # noqa: E731
 
+
+def volume_ok(j):
+    """ok=true допустимо ТОЛЬКО если объём открытого списка совпадает с объёмом
+    раздела. Иначе это листание ЧУЖОГО списка (старая вкладка/карточка) — ровно
+    та ложь, из-за которой прогон 04.11 выглядел успешным (issue e7f7bb098cfd)."""
+    if j.get("scope_mismatch") is not None:
+        return False
+    if not j.get("ok"):
+        return True                      # честный отказ проверяется отдельно
+    total, sec = j.get("total"), j.get("section_count")
+    if total is None or sec is None:
+        return True                      # сверять нечем — ок, но total=null
+    return total == sec
+
+
 print("== ConsPlus live check ==")
 req("GET", "/")  # прогрев/манифест не проверяем строго
 
@@ -98,7 +114,8 @@ st2, j2 = step("2 /search #1 (ключевая ставка)", "POST", "/search"
                {"query": "ключевая ставка", "page_size": 5, "fresh": True}, [
     C("ok", True), ("docs non-empty", lambda j: len(j.get("docs") or []) > 0),
     ("ref present", lambda j: all(d.get("ref") for d in j.get("docs") or [])),
-    D("selected_category"), D("total_source")])
+    D("selected_category"), D("total_source"),
+    ("volume = section (не чужой список)", volume_ok)])
 
 first_titles = [d.get("title") for d in (j2.get("docs") or [])]
 
@@ -116,6 +133,7 @@ st5, j5 = step("5 /search #2 (другой запрос) — анти-проте
                {"query": "обзор судебной практики верховный суд",
                 "page_size": 3, "fresh": True}, [
     D("ok"), ("no stale leak", lambda j: not j.get("stale_suspect")),
+    ("volume = section (не чужой список)", volume_ok),
     ("titles differ from #1",
      lambda j: [d.get("title") for d in (j.get("docs") or [])] != first_titles)])
 if j5.get("ok") is False:

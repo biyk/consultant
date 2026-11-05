@@ -31,7 +31,7 @@ state = {
     "busy": {"active": False, "rid": None, "path": None, "since": None, "last": None},
     "session": {"query": None, "category": None, "total": None, "page_size": config.DEFAULT_PAGE_SIZE,
                 "page": 1, "docs": [], "categories": [], "openable": False,
-                "from_cache": False},
+                "section_count": None, "from_cache": False},
     "known_categories": list(config.CANONICAL_CATEGORIES),  # накопленные валидные имена (для hints/манифеста)
     "ref_titles": {},  # ref -> title из извлечённых ссылок (разрешает /open {ref})
     "last_live": {},   # выдача последнего ЖИВОГО /search — ловушка протечки старого списка
@@ -156,11 +156,15 @@ def manifest():
             "selection_rule": ["requested_category", "approximate",
                                "first_leaf_in_tree_order"],
             "empty_reason": ["no_matches", "list_not_rendered", "tree_not_read",
-                             "section_not_selected", "results_page_not_opened"],
+                             "section_not_selected", "results_page_not_opened",
+                             "list_scope_mismatch"],
             "empty_reason_semantics": "no_matches = подтверждённое «ничего не найдено» "
                                       "(раздел прочитан, count=0). Остальные — "
                                       "техническая неспособность прочитать GUI, они "
-                                      "НИКОГДА не означают отсутствие документов",
+                                      "НИКОГДА не означают отсутствие документов; "
+                                      "list_scope_mismatch = открыт список другого "
+                                      "раздела/вкладки (объём не совпадает с "
+                                      "section_count), строки не отдаются",
             "ok_semantics": "ok=false + retryable=true означает технический сбой "
                             "навигации (выдача НЕ отдавалась как успешная); "
                             "ok=true при total=0 и empty_reason=no_matches — это "
@@ -387,6 +391,9 @@ def _hydrate_session(payload, from_cache=False):
         total=payload.get("total"), page=payload.get("page") or 1,
         page_size=payload.get("page_size") or state["session"]["page_size"],
         docs=docs, categories=payload.get("categories") or [],
+        # объём выбранного раздела — по нему /page сверяет, что листает именно
+        # список этого запроса, а не старую вкладку (issue e7f7bb098cfd)
+        section_count=payload.get("section_count"),
         openable=bool(payload.get("ok")) and bool(docs),
         from_cache=bool(from_cache))
     return docs
@@ -547,7 +554,7 @@ def search():
         # сброс сессии: при любой ошибке ниже docs останутся пустыми → /doc честно отдаст 400
         state["session"].update(query=None, category=None, total=None, page=page,
                                 page_size=page_size, docs=[], openable=False,
-                                from_cache=False)
+                                section_count=None, from_cache=False)
         # 1) навигация на СТРАНИЦУ РЕЗУЛЬТАТОВ ЭТОГО запроса (с одним повтором).
         #    Без этой проверки live-/search отдавал список предыдущего запроса
         #    (issues bb9515a15b8e, aa213ed6f361, 41fd983ff936).
@@ -585,6 +592,7 @@ def search():
         #    видит неполный словарь (issues dbb0182949e2, 5f6bfa0e4a5b)
         sel = None
         sel_count = None
+        sel_approx = False
         selection_rule = None
         sel_note = None
         if category:
@@ -609,6 +617,7 @@ def search():
             _gui.select_category(chosen["name"])
             sel = chosen["name"]
             sel_count = chosen.get("count")
+            sel_approx = "\u2265" in (chosen.get("raw_count") or "")
             if _norm(sel) == _norm(category):
                 selection_rule = "requested_category"
             else:
@@ -623,6 +632,7 @@ def search():
                 _gui.select_category(chosen["name"])
                 sel = chosen["name"]
                 sel_count = chosen.get("count")
+                sel_approx = "\u2265" in (chosen.get("raw_count") or "")
             selection_rule = "first_leaf_in_tree_order"
 
         # 3) перечислить строки списка
@@ -657,7 +667,9 @@ def search():
                     time.sleep(0.5)
                     _gui.select_category(sel)
                     time.sleep(0.5)
-                titles = _gui.enumerate_titles(start_abs, page_size)
+                titles = _gui.enumerate_titles(start_abs, page_size, qflat,
+                                                expect_total=(None if sel_approx
+                                                              else sel_count))
                 docs = _row_from_titles(titles, qflat)
                 _, pos_total = _gui._doc_position()
                 if pos_total:
@@ -666,6 +678,22 @@ def search():
                     break
             if not docs:
                 empty_reason = "list_not_rendered"
+
+        # 3.5) сверка ОБЪЁМА списка. Читалка показывает «Док.N/total» того окна,
+        # которое открыто по факту. Если открытие строки не состоялось, она
+        # продолжает листать СПИСОК ИЗ СТАРОЙ ВКЛАДКИ, и /search отдавал чужие
+        # заголовки как выдачу запроса (в live-прогоне: total=31 при разделе
+        # в 1588 документов). Ложный успех для юридической цитаты хуже
+        # честного отказа (issues e7f7bb098cfd, e15c0d424393).
+        scope_mismatch = None
+        if total and sel_count:
+            bad = (total != sel_count) if not sel_approx else (total < sel_count)
+            if bad:
+                scope_mismatch = {"opened_list_total": total,
+                                  "section_count": sel_count, "section": sel}
+        if scope_mismatch and empty_reason in (None, "list_not_rendered"):
+            # «не то, что листаем» важнее и точнее, чем «не отрендерилось»
+            empty_reason = "list_scope_mismatch"
 
         rows_identical = len(docs) > 1 and len({d["title"] for d in docs}) == 1
         # детектор протечки: для ДРУГОГО запроса получился посимвольно тот же
@@ -698,6 +726,13 @@ def search():
                     "в разделе %r найдено %s документов, но строки списка не "
                     "прочитаны за %s попытки — это НЕ «нет результатов» "
                     "(повтори /search)" % (sel, sel_count, enum_attempts))
+        elif empty_reason == "list_scope_mismatch":
+            note = ((note + "; " if note else "") +
+                    "открытый список содержит %s документов, а в разделе %r их %s — "
+                    "мы листаем НЕ список этого запроса (старая вкладка/карточка), "
+                    "поэтому строки не отданы; это НЕ «нет результатов», "
+                    "повтори /search" % (scope_mismatch["opened_list_total"],
+                                          sel, sel_count))
         # частичное чтение списка — не выдаём его как полный
         truncated = bool(ok and docs_out and expected and len(docs_out) < expected)
         if truncated:
@@ -723,6 +758,7 @@ def search():
             "retryable": not ok,
             "error": None if ok else (empty_reason or "list_not_rendered"),
             "rows_identical": rows_identical, "stale_suspect": stale_suspect,
+            "scope_mismatch": scope_mismatch,
             "dropped_rows": dropped, "enum_attempts": enum_attempts,
             "openable": bool(docs_out),
             "index_as_of": idx_info["index_as_of"],
@@ -821,8 +857,24 @@ def page():
     def work():
         _ensure_gui()
         ps = sess["page_size"]
-        titles = _gui.enumerate_titles((p - 1) * ps + 1, ps)
-        docs = _row_from_titles(titles, _flat(sess["query"] or ""))
+        qflat = _flat(sess["query"] or "")
+        titles = _gui.enumerate_titles((p - 1) * ps + 1, ps, qflat)
+        docs = _row_from_titles(titles, qflat)
+        _, pos_total = _gui._doc_position()
+        sec_count = sess.get("section_count")
+        if pos_total and sec_count and pos_total != sec_count:
+            # листаем НЕ тот список (объём читалки не совпадает с разделом) —
+            # строки не отдаём (issue e7f7bb098cfd)
+            return {"ok": False, "error": "list_scope_mismatch",
+                    "empty_reason": "list_scope_mismatch", "page": p,
+                    "docs": [], "total": None, "retryable": True,
+                    "parsed_count": 0, "scope_mismatch": {
+                        "opened_list_total": pos_total,
+                        "section_count": sec_count,
+                        "section": sess.get("category")},
+                    "note": "страница %s открыла список в %s документов при "
+                            "разделе в %s — это не выдача запроса %r"
+                            % (p, pos_total, sec_count, sess["query"])}
         if not docs:
             # сессию НЕ затираем: прежняя выдача остаётся адресуемой
             return {"ok": False, "error": "list_not_rendered", "page": p,
@@ -831,7 +883,6 @@ def page():
                     "note": "страница %s не отрендерена — сессия осталась от "
                             "предыдущей страницы" % p}
         sess.update(page=p, docs=docs, openable=True, from_cache=False)
-        _, pos_total = _gui._doc_position()
         if pos_total:
             sess["total"] = pos_total
         return {"ok": True, "page": p, "docs": docs, "total": sess["total"],
@@ -1050,9 +1101,16 @@ def open_():
         cats = _gui.read_categories()
         leaves = [c for c in cats if c["leaf"] and c.get("count")]
         leaves.sort(key=lambda c: c["count"] or 0, reverse=True)
+        expect_total = None
         if leaves:
             _gui.select_category(leaves[0]["name"])
-        titles = _gui.enumerate_titles(1, max(config.DEFAULT_PAGE_SIZE, 10))
+            # /open обязан брать строки ИЗ СПИСКА этого запроса: если читалка
+            # показывает другой объём, candidates/документ могли прийти из
+            # старой вкладки (issue e7f7bb098cfd)
+            if "\u2265" not in (leaves[0].get("raw_count") or ""):
+                expect_total = leaves[0].get("count")
+        titles = _gui.enumerate_titles(1, max(config.DEFAULT_PAGE_SIZE, 10), qflat,
+                                       expect_total=expect_total)
         scored = sorted((( _score_title(tt, qflat), ab, tt) for ab, tt in titles if tt),
                         key=lambda x: x[0], reverse=True)
         candidates = [{"title": tt, "score": round(sc, 3), "ref": "pos:%s" % ab}

@@ -45,6 +45,14 @@ _RE_UI_SUFFIX = re.compile(r"\s*\(\s*Искать\s*\)\s*$", re.IGNORECASE)
 _RE_UI_ANYWHERE = re.compile(r"\(\s*Искать\s*\)", re.IGNORECASE)
 
 
+def _norm_title(s):
+    """Свернённое сравнение имён: кавычки/«ёлочки»/NBSP/пробелы не важны.
+    Нужно, чтобы опознать «это эхо запроса, а не заголовок документа»."""
+    s = (s or "").replace("\u00a0", " ").replace("\u201c", '"').replace("\u201d", '"')
+    s = re.sub(r"[\"'\u00ab\u00bb\s]+", " ", s)
+    return s.strip().lower()
+
+
 # --- буфер обмена (кириллица без зависимости от раскладки) -------------------
 def _clip_set_text(text):
     win32clipboard.OpenClipboard()
@@ -419,9 +427,15 @@ class ConsultantGUI:
         return {"state": self._state_suffix(), "doc_index": cur, "doc_total": total}
 
     # -- область открытого документа (для заголовков и позиции) --
-    def _doc_title(self):
+    def _doc_title(self, query_flat=None):
+        """Заголовок открытого документа. query_flat — нормализованный текст
+        текущего запроса; поля поиска ОБЯЗАТЕЛЬНО отбрасываются: иначе, когда
+        читалка пуста, вместо заголовка возвращается сам запрос («эхо»), и
+        выдача превращается в N одинаковых строк (зонд: 'обзор судебной
+        практики верховный суд' ×3)."""
         bad = ("Сортировка", "Профиль", "Результаты", "Наиболее", "См. также", "©",
                "Быстрый поиск", "Уточнить")
+        search_aids = (config.AID_SEARCH_EDIT, config.AID_SEARCH_EDIT2)
         cands = []
         for e in self._descendants(control_type="Edit"):
             nm = (e.element_info.name or "").strip()
@@ -429,6 +443,11 @@ class ConsultantGUI:
                 continue
             if any(b in nm for b in bad):
                 continue
+            if (e.element_info.automation_id or "") in search_aids:
+                continue                      # поле поиска, не заголовок
+            flat = _norm_title(nm)
+            if query_flat and flat and (flat == query_flat or query_flat in flat):
+                continue                      # эхо запроса в поле/чипе поиска
             r = e.rectangle()
             if r.top < 320 and (r.right - r.left) > 300:
                 cands.append((r.top, -self._w(e), nm))
@@ -441,16 +460,59 @@ class ConsultantGUI:
         return t
 
     def _doc_position(self):
-        """(N, total) из Edits 'Док. N' и '/total'; иначе (None, None)."""
-        n = total = None
+        """(N, total) счётчика «Док. N» / «/total» — позиция в СПИСКЕ выдачи.
+
+        В нижней строке состояния ДВА парных счётчика:
+            «Док. 3» «/1588»   — документ и объём списка раздела
+            «Абз. 2668» «/10061» — абзац и объём всего результата поиска
+        Раньше total брался из ПОСЛЕДНЕГО совпадения «/число», то есть в него
+        попадало число АБЗАЦЕВ (10061 вместо 1588): сверка «объём открытого
+        списка == объём раздела» была обречена, а /search отдавал чужие числа
+        (issues e7f7bb098cfd, e15c0d424393). Теперь пару ищем геометрически:
+        ближайший «/N» ПРАВЕЕ счётчика «Док.» (у «Абз.» свой left — левее
+        него мы не переходим)."""
+        edits = []
         for e in self._descendants(control_type="Edit"):
-            nm = (e.element_info.name or "").replace("\xa0", " ")
+            nm = (e.element_info.name or "").replace("\u00a0", " ").strip()
+            if not nm:
+                continue
+            try:
+                left = e.rectangle().left
+            except Exception:  # noqa: BLE001
+                left = None
+            edits.append((left, nm))
+
+        n, doc_left, doc_pos = None, None, None
+        for pos, (left, nm) in enumerate(edits):
             m = re.search(r"Док\.?\s*(\d+)", nm)
             if m:
                 n = int(m.group(1))
-            m2 = re.search(r"/\s*([\d\s]+)$", nm.strip())
-            if m2 and re.sub(r"\D", "", m2.group(1)):
-                total = int(re.sub(r"\D", "", m2.group(1)))
+                doc_left, doc_pos = left, pos
+                break
+        total = None
+        # 1) по геометрии: ближайший «/N» правее «Док.»
+        if doc_left is not None:
+            cands = [(l, nm) for (l, nm) in edits
+                     if l is not None and l > doc_left and
+                     re.fullmatch(r"/\s*[\d\s]+", nm)]
+            cands.sort(key=lambda t: t[0])
+            if cands:
+                total = int(re.sub(r"\D", "", cands[0][1]))
+        # 2) запасной вариант: порядок обхода элементов как список
+        if total is None and doc_pos is not None:
+            for _left, nm in edits[doc_pos + 1:]:
+                if re.search(r"Абз\.?\s*\d+", nm):
+                    break                     # дальше счётчик абзацев — не сюда
+                m2 = re.search(r"/\s*([\d\s]+)$", nm)
+                if m2 and re.sub(r"\D", "", m2.group(1)):
+                    total = int(re.sub(r"\D", "", m2.group(1)))
+                    break
+        # 3) «Док.» вообще не прочитался — прежний общий поиск total
+        if doc_pos is None:
+            for _left, nm in edits:
+                m2 = re.search(r"/\s*([\d\s]+)$", nm.strip())
+                if m2 and re.sub(r"\D", "", m2.group(1)):
+                    total = int(re.sub(r"\D", "", m2.group(1)))
         return n, total
 
     def _nav_button(self, needle):
@@ -510,26 +572,100 @@ class ConsultantGUI:
             cur, _ = self._doc_position()
         return cur
 
-    def open_first_doc(self, x=900, y=300):
-        """Открыть первый документ списка двойным кликом (перевод в читалку).
-        Без этого enumerate/next_doc не работают: на странице списка нет 'Док.N'."""
-        self.ensure_window()
-        LOG.info("open_first_doc: dbl-click (%s,%s)", x, y)
-        self.win.click_input(coords=(x, y), double=True)
-        time.sleep(2.5)
-        cur, total = self._doc_position()
-        LOG.info("open_first_doc: pos=%s/%s", cur, total)
-        return cur is not None
+    def list_pane_rect(self):
+        """Прямоугольник области СПИСКА выдачи. Сам список — owner-drawn Pane
+        (class Afx:..., aid 59648) без UIA-детей, строк через UIA не прочитать
+        (проверено зондом), поэтому хотя бы кликать надо по НЕЙ, а не по
+        жёстким координатам окна: на странице быстрой выдачи (900,300) попадает
+        в полосу «Наиболее соответствуют запросу», и двойной клик не открывает
+        НИЧЕГО (issue e15c0d424393). Берём самый «глубокий» (с наибольшим top)
+        крупный контейнер правее шапки — это внутренняя область контента."""
+        best = None
+        for t in ("Pane", "Window"):
+            for e in self._descendants(control_type=t):
+                i = e.element_info
+                if i.class_name in ("MDIClient",) or (i.name or ""):
+                    continue          # не рабочая область и не именованные окна
+                try:
+                    r = e.rectangle()
+                except Exception:  # noqa: BLE001
+                    continue
+                if r.width() < 700 or r.height() < 350 or r.top < 230:
+                    continue
+                key = (r.top, r.width() * r.height())
+                if best is None or key > best[0]:
+                    best = (key, r)
+        return best[1] if best else None
 
-    def enumerate_titles(self, start_abs, count):
-        """Вернуть [(abs_index, title)] для документов выдачи [start_abs, start_abs+count)."""
-        LOG.info("enumerate_titles start_abs=%s count=%s", start_abs, count)
+    def ensure_list_page(self, max_back=2):
+        """Уйти из читалки на страницу списка. Если 'Док.N' читается — открыт
+        документ (легко — из СТАРОЙ вкладки), и клик по списку тогда ничего не
+        меняет: enumerate начал бы листать чужой список и выдал бы его за выдачу
+        (именно так шаг 2 живой проверки отдавал 31 документ вместо 1588)."""
+        n = 0
+        while self._doc_position()[0] is not None and n < max_back:
+            LOG.info("ensure_list_page: открыт документ %s — жму «Назад»",
+                     self._doc_position())
+            try:
+                self.go_back()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("ensure_list_page: «Назад» не прошёл: %r", exc)
+                break
+            n += 1
+        return self._doc_position()[0] is None
+
+    def open_first_doc(self, x=900, y=300, row_step=37, tries=4):
+        """Открыть первый документ списка ДВОЙНЫМ КЛИКОМ ПО ОБЛАСТИ СПИСКА.
+        Возвращает True только если клик реально открыл (другой) список:
+        сверяем 'Док.N/total' до и после. Раньше это был один клик вслепую
+        по (900,300), после которого перечисление молча листало любой
+        ранее открытый документ (issues e15c0d424393, e7f7bb098cfd)."""
+        self.ensure_window()
+        self.ensure_list_page()
+        before = self._doc_position()
+        pane = self.list_pane_rect()
+        points = []
+        if pane is not None:
+            LOG.info("open_first_doc: область списка %s", pane)
+            for k in range(tries):
+                points.append((pane.left + 300, pane.top + 25 + row_step * k))
+        points.append((x, y))          # старый жёсткий вариант — последняя попытка
+        for (px, py) in points:
+            LOG.info("open_first_doc: dbl-click (%s,%s)", px, py)
+            try:
+                self.win.click_input(coords=(px, py), double=True)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("open_first_doc: клик не прошёл: %r", exc)
+            time.sleep(1.5)
+            cur = self._doc_position()
+            if cur[0] is not None and cur != before:
+                LOG.info("open_first_doc: pos=%s/%s (до клика было %s/%s)",
+                         cur[0], cur[1], before[0], before[1])
+                return True
+            time.sleep(0.5)
+        LOG.warning("open_first_doc: ни одна точка не открыла список "
+                    "(до=%s после=%s) — на странице списка нас, скорее всего, "
+                    "нет", before, self._doc_position())
+        return False
+
+    def enumerate_titles(self, start_abs, count, query_flat=None, expect_total=None):
+        """Вернуть [(abs_index, title)] для документов выдачи [start_abs, start_abs+count).
+        query_flat — нормализованный запрос: нужен, чтобы не выдать эхо поля
+        поиска за заголовок документа.
+        expect_total — сколько документов должен содержать список (count выбранного
+        раздела): если читалка показывает ДРУГОЙ объём, мы листаем не тот список
+        (старая вкладка/карточка), и заголовки не отдаём (issue e7f7bb098cfd)."""
+        LOG.info("enumerate_titles start_abs=%s count=%s expect_total=%s",
+                 start_abs, count, expect_total)
         res = []
         cur0, _t0 = self._doc_position()
         if cur0 is None:
             # читалка не открыта (мы на странице списка) — открыть первый документ
             LOG.info("enumerate_titles: читалка не открыта — открываю первый документ")
-            self.open_first_doc()
+            if not self.open_first_doc():
+                LOG.warning("enumerate_titles: открытие строки списка не состоялось — "
+                            "заголовки не читаем (иначе отдадим чужой список)")
+                return []
         got = self.goto_doc_index(start_abs)
         cur, total = self._doc_position()
         LOG.info("enumerate_titles: goto=%s cur=%s total=%s", got, cur, total)
@@ -539,8 +675,12 @@ class ConsultantGUI:
             # запроса (issues bb9515a15b8e, f3aa36f9a116) — честно возвращаем пусто.
             LOG.warning("enumerate_titles: позиция 'Док.N' не читается — отдаём пустой список")
             return []
+        if expect_total and total and total != expect_total:
+            LOG.warning("enumerate_titles: объём списка %s не совпадает с разделом %s — "
+                        "это не список запроса, отдаём пусто", total, expect_total)
+            return []
         for i in range(count):
-            title = self._doc_title()
+            title = self._doc_title(query_flat)
             idx = cur if cur is not None else start_abs + i
             res.append((idx, title))
             LOG.debug("  doc idx=%s titlelen=%s head=%r", idx, len(title), title[:50])
