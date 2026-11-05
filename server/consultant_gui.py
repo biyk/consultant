@@ -446,8 +446,16 @@ class ConsultantGUI:
             if (e.element_info.automation_id or "") in search_aids:
                 continue                      # поле поиска, не заголовок
             flat = _norm_title(nm)
-            if query_flat and flat and (flat == query_flat or query_flat in flat):
-                continue                      # эхо запроса в поле/чипе поиска
+            # Отбрасываем только ВЕРБАТИМ-эхо запроса (чип/поле = сам запрос).
+            # Раньше гасился ЛЮБОЙ заголовок, СОДЕРЖАЩИЙ запрос — но реальные
+            # документы попадают в выдачу именно потому, что в их названии есть
+            # слова поиска
+            # (зонд main_titles: при запросе «ставка» заголовок на top=179
+            # «Справочная информация: "Ключевая ставка и процентная ставка…"»
+            # терялся как «эхо», и _doc_title возвращал полосу раздела
+            # «Российское законодательство (Версия Проф)» на top=191).
+            if query_flat and flat and flat == query_flat:
+                continue                      # чип/поле = сам запрос, не заголовок
             r = e.rectangle()
             if r.top < 320 and (r.right - r.left) > 300:
                 cands.append((r.top, -self._w(e), nm))
@@ -615,21 +623,30 @@ class ConsultantGUI:
         return self._doc_position()[0] is None
 
     def open_first_doc(self, x=900, y=300, row_step=37, tries=4):
-        """Открыть первый документ списка ДВОЙНЫМ КЛИКОМ ПО ОБЛАСТИ СПИСКА.
+        """Открыть первый документ списка ДВОЙНЫМ КЛИКОМ с ПРОВЕРКОЙ.
         Возвращает True только если клик реально открыл (другой) список:
         сверяем 'Док.N/total' до и после. Раньше это был один клик вслепую
         по (900,300), после которого перечисление молча листало любой
-        ранее открытый документ (issues e15c0d424393, e7f7bb098cfd)."""
+        ранее открытый документ (issues e15c0d424393, e7f7bb098cfd).
+
+        Порядок точек — по живой проверке (зонды main_grid/main_titles): на этой
+        сборке К+ первая строка результата лежит в полосе «Наиболее соответствуют
+        запросу» (~y=300 при x=900), а pane-область списка начинается НИЖЕ
+        (top≈339), и клики по её отступам открывают НЕ тот подсписок. Поэтому
+        доказанная точка идёт ПЕРВОЙ, а pane-точки — запасными для других
+        раскладок/DPI. Надёжность не в порядке, а в проверке: True лишь если
+        'Док.N' реально изменился, иначе честно возвращаем False."""
         self.ensure_window()
         self.ensure_list_page()
         before = self._doc_position()
         pane = self.list_pane_rect()
-        points = []
+        points = [(x, y)]              # доказанная первая строка — первой попыткой
         if pane is not None:
             LOG.info("open_first_doc: область списка %s", pane)
             for k in range(tries):
-                points.append((pane.left + 300, pane.top + 25 + row_step * k))
-        points.append((x, y))          # старый жёсткий вариант — последняя попытка
+                p = (pane.left + 300, pane.top + 25 + row_step * k)
+                if p not in points:
+                    points.append(p)   # запасные точки — для других раскладок
         for (px, py) in points:
             LOG.info("open_first_doc: dbl-click (%s,%s)", px, py)
             try:

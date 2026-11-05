@@ -1287,17 +1287,26 @@ class TestGuiTitleEcho(unittest.TestCase):
         # «выдачи из одного и того же текста»
         self.assertEqual(g._doc_title(), '"%s"' % self.Q)
 
-    def test_title_with_query_inside_still_dropped(self):
-        # «обзор судебной практики верховный суд» внутри длинного заголовка-эха
-        edits = [_El(name=self.Q + " (КонсультантПлюс, 2026)", aid="8888",
-                     rect=_Rect(300, 210, 1352, 240))]
-        self.assertEqual(self._gui(edits)._doc_title(self.Q), "")
+    def test_title_with_query_inside_is_kept(self):
+        # регресс зонда main_titles: реальный заголовок, СОДЕРЖАЩИЙ слова
+        # запроса, — не «эхо» и не должен теряться. Раньше из-за этого на
+        # 2-м документе /search отдавал полосу раздела вместо заголовка
+        # (при запросе «ставка» заголовок «...Ключевая ставка и процентная
+        # ставка...» терялся как «эхо», и побеждала полоса на top=191).
+        q = "ставка"
+        title = 'Справочная информация: "Ключевая ставка и процентная ставка"'
+        edits = [_El(name=title, aid="",
+                     rect=_Rect(291, 179, 1363, 200)),
+                 _El(name="Российское законодательство (Версия Проф)", aid="",
+                     rect=_Rect(291, 191, 783, 212))]
+        self.assertEqual(self._gui(edits)._doc_title(q), title)
 
 
 class TestGuiOpenFirstDoc(unittest.TestCase):
-    """Открытие строки списка (issues e15c0d424393, e7f7bb098cfd): кликаем по
-    ОБЛАСТИ списка, а не по жёстким координатам, и верим, что клик реально
-    что-то открыл."""
+    """Открытие строки списка (issues e15c0d424393, e7f7bb098cfd): клик
+    ВСЕГДА проверяется — 'Док.N' обязан измениться, иначе успех вслепую
+    невозможен. Первой пробуем доказанную живым прогоном точку первой строки,
+    pane-точки — запасными для других раскладок."""
 
     PANE = _Rect(290, 268, 1872, 900)      # внутренняя область контента
 
@@ -1328,27 +1337,35 @@ class TestGuiOpenFirstDoc(unittest.TestCase):
         g.state = state
         return g
 
-    def test_clicks_are_inside_list_pane(self):
+    def test_proven_point_is_tried_first(self):
+        # доказанная первая строка (900,300) открывает список сразу — pane-
+        # точки (которые на этой сборке промахивают и жгут ~время) не тратятся
         clicks = []
-        # читалка закрыта; список открывается со второго клика по области
+        g = self._gui(pane=self.PANE, clicks=clicks, open_after=1)
+        with mock.patch("time.sleep"):
+            self.assertTrue(g.open_first_doc())
+        self.assertEqual(clicks, [(900, 300)])
+
+    def test_falls_back_to_pane_points_when_proven_misses(self):
+        # если (900,300) не открыл (другая раскладка/DPI) — пробуем pane-точки
+        clicks = []
         g = self._gui(pane=self.PANE, clicks=clicks, open_after=2)
         with mock.patch("time.sleep"):
             self.assertTrue(g.open_first_doc())
+        self.assertEqual(clicks[0], (900, 300))          # доказанная — первой
         self.assertEqual(len(clicks), 2)
-        for (x, y) in clicks:
-            self.assertTrue(self.PANE.left <= x <= self.PANE.right,
-                            "клик %s вне области списка" % ((x, y),))
-            self.assertTrue(self.PANE.top <= y <= self.PANE.bottom)
-        self.assertNotIn((900, 300), clicks)      # жёсткая точка больше не первая
+        x, y = clicks[1]
+        self.assertTrue(self.PANE.left <= x <= self.PANE.right)
+        self.assertTrue(self.PANE.top <= y <= self.PANE.bottom)
 
-    def test_hardcoded_point_is_only_last_fallback(self):
+    def test_returns_false_when_nothing_opens(self):
+        # ни одна точка не открыла → честный False (а не «успех» вслепую)
         clicks = []
-        # ничего не открывается → уходим с False, а не с «успехом»
         g = self._gui(pane=self.PANE, clicks=clicks, stale=(5, 31))
         with mock.patch("time.sleep"):
             self.assertFalse(g.open_first_doc())
-        self.assertEqual(clicks[-1], (900, 300))
-        self.assertEqual(g.state["backs"], 2)     # из читалки вышли («Назад»)
+        self.assertEqual(clicks[0], (900, 300))          # первой была доказанная
+        self.assertEqual(g.state["backs"], 2)            # из читалки вышли («Назад»)
 
     def test_no_pane_falls_back_to_old_point(self):
         clicks = []

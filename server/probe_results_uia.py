@@ -668,6 +668,78 @@ def main_title():
     return 0
 
 
+def main_titles():
+    """Почему _doc_title() на 2-м документе вернул полосу «Российское
+    законодательство (Версия Проф)», а не заголовок? Проходим так же, как
+    /search: открыть 1-ю строку (рабочая точка 900,300) и для каждого из
+    первых N документов напечатать (pos, что вернул _doc_title) и ВСЕ Edit
+    зоны заголовка (top<320 и ширина>300) с их top — видно, какой элемент
+    реально несёт заголовок и пустеет ли полоса 179 в момент чтения."""
+    from server.consultant_gui import ConsultantGUI
+    gui = ConsultantGUI()
+    if not gui.connect(timeout=30):
+        log("СТОП: окно К+ не найдено")
+        return 2
+    win = gui.win
+    log("=== зонд заголовков по документам (query=%r) ===" % QUERY)
+    gui.close_modal_dialogs()
+    gui.close_extra_tabs(keep=1)
+    if not gui.do_search(QUERY):
+        log("СТОП: поиск не открылся")
+        return 2
+    gui.open_all_results()
+    gui.wait_tree(timeout=40)
+    cats = gui.read_categories()
+    leaf = next((c for c in cats if c.get("leaf") and c.get("count")), None)
+    if leaf is None:
+        log("СТОП: дерево не прочитано")
+        return 2
+    try:
+        gui.select_category(leaf["name"])
+        time.sleep(1.2)
+    except Exception as exc:  # noqa: BLE001
+        log("  select_category: %r" % exc)
+    qflat = _flatq(QUERY)
+    log("раздел %r count=%s" % (leaf["name"], leaf.get("count")))
+
+    gui.ensure_list_page()
+    win.click_input(coords=(900, 300), double=True)     # доказанная рабочая точка
+    time.sleep(2.0)
+    cur, total = gui._doc_position()
+    log("после открытия: pos=%s/%s" % (cur, total))
+    if cur is None:
+        log("СТОП: читалка не открылась")
+        return 2
+    for i in range(6):
+        title = gui._doc_title(qflat)
+        cur, total = gui._doc_position()
+        log("\n--- док #%d pos=%s/%s  _doc_title=%r" % (i + 1, cur, total,
+                                                        trunc(title, 80)))
+        log("    зона заголовка (top<320, w>300):")
+        rows = []
+        for e in win.descendants(control_type="Edit"):
+            nm = (e.element_info.name or "").strip()
+            if not nm:
+                continue
+            r = e.rectangle()
+            if r.top < 320 and r.width() > 300:
+                rows.append((r.top, r.width(), nm))
+        rows.sort()
+        for top, w, nm in rows:
+            log("      top=%-5d w=%-5d %r" % (top, w, trunc(nm, 72)))
+        if not gui.next_doc():
+            log("    next_doc не сработал — стоп")
+            break
+        time.sleep(1.0)
+    try:
+        gui.go_back()
+        gui.close_extra_tabs(keep=1)
+    except Exception:  # noqa: BLE001
+        pass
+    log("=== конец зонда заголовков ===")
+    return 0
+
+
 def main():
     from server.consultant_gui import ConsultantGUI
 
@@ -737,6 +809,8 @@ if __name__ == "__main__":
             rc = main_grid()
         elif mode == "title":
             rc = main_title()
+        elif mode == "titles":
+            rc = main_titles()
         else:
             rc = main()
     except Exception as exc:  # noqa: BLE001
