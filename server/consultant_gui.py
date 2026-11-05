@@ -39,6 +39,12 @@ class NotFound(GuiError):
     pass
 
 
+# Ярлыки вида «Судебная практика (Искать)» — элемент интерфейса, а не имя раздела
+# (issue 5f6bfa0e4a5b): срезаем суффикс, иначе словарь разделов зависит от позиции.
+_RE_UI_SUFFIX = re.compile(r"\s*\(\s*Искать\s*\)\s*$", re.IGNORECASE)
+_RE_UI_ANYWHERE = re.compile(r"\(\s*Искать\s*\)", re.IGNORECASE)
+
+
 # --- буфер обмена (кириллица без зависимости от раскладки) -------------------
 def _clip_set_text(text):
     win32clipboard.OpenClipboard()
@@ -334,18 +340,31 @@ class ConsultantGUI:
 
     def read_categories(self):
         cats = []
+        seen = {}
         for _, name in self.tree_items():
-            m = re.match(r"^(.*?)[\s\u00a0]+(\u2265?\s*[\d\s]+)$", name.strip())
+            name = name.replace("\u00a0", " ")
+            name = re.sub(r"\s+", " ", _RE_UI_ANYWHERE.sub(" ", _RE_UI_SUFFIX.sub("", name))).strip()
+            if not name:
+                continue
+            m = re.match(r"^(.*?)[\s\u00a0]+(\u2265?\s*[\d\s]+)$", name)
             if m:
                 label = m.group(1).strip()
                 raw = m.group(2).strip()
                 digits = re.sub(r"\D", "", raw)
                 count = int(digits) if digits and "\u2265" not in raw else (int(digits) if digits else None)
-                cats.append({"name": label, "count": count,
-                             "raw_count": raw, "leaf": True})
+                rec = {"name": label, "count": count,
+                       "raw_count": raw, "leaf": True}
             else:
-                cats.append({"name": name.strip(), "count": None,
-                             "raw_count": "", "leaf": False})
+                rec = {"name": name, "count": None,
+                       "raw_count": "", "leaf": False}
+            prev = seen.get(rec["name"])
+            if prev is None:
+                seen[rec["name"]] = rec
+                cats.append(rec)
+            elif (rec["count"] or 0) > (prev["count"] or 0):
+                prev["count"] = rec["count"]
+                prev["raw_count"] = rec["raw_count"]
+                prev["leaf"] = prev["leaf"] or rec["leaf"]
         LOG.info("read_categories: %d разделов", len(cats))
         return cats
 
@@ -387,6 +406,17 @@ class ConsultantGUI:
         LOG.info("open_all_results: клик по «Все результаты поиска» выполнен")
         time.sleep(1.5)
         return True
+
+    def page_info(self):
+        """Снимок текущей страницы: состояние окна + позиция читалки. Нужен, чтобы
+        честными данными отвечать, живём ли мы на списке THIS запроса
+        (issues aa213ed6f361, bb9515a15b8e)."""
+        cur, total = (None, None)
+        try:
+            cur, total = self._doc_position()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"state": self._state_suffix(), "doc_index": cur, "doc_total": total}
 
     # -- область открытого документа (для заголовков и позиции) --
     def _doc_title(self):
@@ -504,7 +534,11 @@ class ConsultantGUI:
         cur, total = self._doc_position()
         LOG.info("enumerate_titles: goto=%s cur=%s total=%s", got, cur, total)
         if cur is None:
-            LOG.warning("enumerate_titles: позиция 'Док.N' не читается — doc view не активен")
+            # Позицию 'Док.N' прочитать не удалось → читалка НЕ на этом списке.
+            # Собирать заголовки в этом случае — значит выдать список предыдущего
+            # запроса (issues bb9515a15b8e, f3aa36f9a116) — честно возвращаем пусто.
+            LOG.warning("enumerate_titles: позиция 'Док.N' не читается — отдаём пустой список")
+            return []
         for i in range(count):
             title = self._doc_title()
             idx = cur if cur is not None else start_abs + i
@@ -514,7 +548,11 @@ class ConsultantGUI:
                 if not self.next_doc():
                     LOG.warning("  next_doc() failed on i=%s", i)
                     break
-                cur, _ = self._doc_position()
+                nxt, _ = self._doc_position()
+                if nxt is None or nxt == cur:
+                    LOG.warning("  позиция всталась на i=%s (cur=%s) — обрыв навигации", i, cur)
+                    break
+                cur = nxt
         LOG.info("enumerate_titles: собрано %d заголовков", len(res))
         return res
 

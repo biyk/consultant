@@ -66,8 +66,14 @@ SCOPE_SINGLE_SECTION = "single_section"
 # Минимальная длина текста, чтобы считать экспорт документа удался (иначе unavailable)
 DOC_MIN_CONTENT = int(os.environ.get("CONSULTANT_DOC_MIN_CONTENT", "40"))
 # Дата среза индекса (best-effort; юрист-клиент distinguishes «нет в базе» vs «не обновлено»).
-# Задаётся снаружи: env CONSULTANT_INDEX_AS_OF=ГГГГ-ММ-ДД (или пусто → «unknown»).
+# Задаётся снаружи: env CONSULTANT_INDEX_AS_OF=ГГГГ-ММ-ДД (или пусто → авто-детект).
 INDEX_AS_OF = os.environ.get("CONSULTANT_INDEX_AS_OF", "").strip()
+# Auto-detect: нижняя граница среза по штампам «ред. от …», «с изм. от …»,
+# «по состоянию на …» в реально прочитанных документах (issues e47ded1737cb,
+# 3f6dd95f968b). Работает, только когда env не задан.
+INDEX_AS_OF_AUTO = os.environ.get("CONSULTANT_INDEX_AS_OF_AUTO", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+INDEX_OBSERVED_STORE = os.path.join(LOGS_DIR, "index_observed.json")
 # Канонический список разделов верхнего уровня (для манифеста и фолбэка hints,
 # когда свежее чтение дерева не далo имён).
 CANONICAL_CATEGORIES = [

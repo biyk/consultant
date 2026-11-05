@@ -77,16 +77,36 @@ def ingest(rtf_path, key):
     return dst
 
 
+def _ansicpg(raw_head):
+    m = re.search(r"ansicpg(\d{3,5})", raw_head or "", re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def _rtf_raw(path):
-    """Прочитать RTF как текст: cp1251-first (файлы К+ в ansicpg1251)."""
-    for enc in ("cp1251", "utf-8", "latin-1"):
-        try:
-            with io.open(path, "r", encoding=enc) as f:
-                return f.read()
-        except (UnicodeDecodeError, OSError):
-            continue
+    """Прочитать RTF как текст. Файлы К+ — в ansicpg1251; раньше здесь вторым
+    шагом стоял latin-1, который NEVER падает, и добрая часть документов
+    возвращалась в mojibake («Äîêóìåíò ïðåäîñòàâëåí …», issue afeb1abcaef3).
+    Теперь: кодировка из заголовка RTF → cp1251 с заменами, latin-1 не используется."""
     with io.open(path, "rb") as f:
-        return f.read().decode("cp1251", "replace")
+        blob = f.read()
+    if blob.startswith(b"\xef\xbb\xbf"):
+        return blob.decode("utf-8", "replace")
+    if blob.startswith(b"\xff\xfe") or blob.startswith(b"\xfe\xff"):
+        return blob.decode("utf-16", "replace")
+    cp = _ansicpg(blob[:400].decode("ascii", "ignore"))
+    for enc in ("cp%d" % cp if cp else None, "cp1251", "utf-8"):
+        if not enc:
+            continue
+        try:
+            return blob.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return blob.decode("cp1251", "replace")
 
 
 def rtf_to_clean_text(path=None, raw=None):
@@ -97,7 +117,74 @@ def rtf_to_clean_text(path=None, raw=None):
         text = rtf_to_text(raw, errors="replace")
     except Exception:  # noqa: BLE001
         text = raw
-    return _clean(text)
+    text = _clean(text)
+    # Починку mojibake делает вызывающий (app._prep_text) — так один и тот же
+    # фикст применяется и к свежему экспорту, и к давно закешированным телам.
+    return text
+
+
+_RE_LATIN1_HIGH = re.compile(r"[\u00c0-\u00ff]")
+
+
+def fix_mojibake(text):
+    """Починить CP1251, прочитанный как Latin-1 («Äîêóìåíò» → «Документ»).
+
+    Возвращает (text, repaired). Применяется и к свежим экспортам, и к уже
+    закешированным телам (data/docs/*.txt записаны с браком).
+    """
+    if not text:
+        return text or "", False
+    sample = text[:4000]
+    hi = len(_RE_LATIN1_HIGH.findall(sample))
+    letters = len(re.findall(r"[A-Za-z\u00c0-\u00ff]", sample))
+    if hi < 8 or letters == 0 or hi / max(letters, 1) < 0.5:
+        return text, False
+    try:
+        cand = sample.encode("latin-1", "strict").decode("cp1251", "strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text, False
+    cyr = len(re.findall(r"[\u0410-\u044f\u0401\u0451]", cand))
+    if cyr < max(4, int(hi * 0.5)):
+        return text, False
+    try:
+        full = text.encode("latin-1", "replace").decode("cp1251", "replace")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text, False
+    return full, True
+
+
+# Штампы свежести в текстах К+ — источник для auto-detect даты среза базы
+# (issues e47ded1737cb, 3f6dd95f968b, 975f6227e620).
+_RE_STAMP = re.compile(
+    r"(?:ред\.|с\s+изм\.|по\s+состоянию\s+на|Актуально\s+на)"
+    r"[^\d\n]{0,20}?(\d{2}[./-]\d{2}[./-]\d{4})", re.IGNORECASE)
+_RE_DDMMYYYY = re.compile(r"^\s*(\d{1,2})[.](\d{1,2})[.](\d{4})\s*$")
+
+
+def extract_freshness_dates(text, limit=5):
+    """(iso_max, [доказательства]) по штампам «ред. от …», «с изм. от …»,
+    «по состоянию на …», «Актуально на …». Даты позже сегодняшнего игнорируются
+    (это «вступает в силу», а не дата среза)."""
+    if not text:
+        return None, []
+    found = []
+    for m in _RE_STAMP.finditer(text):
+        d = _RE_DDMMYYYY.match(m.group(1))
+        if not d:
+            continue
+        try:
+            iso = "%04d-%02d-%02d" % (int(d.group(3)), int(d.group(2)), int(d.group(1)))
+            time.strptime(iso, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        if iso > time.strftime("%Y-%m-%d"):
+            continue
+        if iso not in found:
+            found.append(iso)
+    if not found:
+        return None, []
+    found.sort()
+    return found[-1], found[-limit:]
 
 
 _RE_INFO_TITLE = re.compile(r"\\info\s*\{\\title\s*(.+?)\}", re.DOTALL)

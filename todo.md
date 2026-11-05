@@ -523,3 +523,80 @@ D:\ConsPlus\
 ### 12.4 Уборка
 - Одноразовые `_dump_issues.py`, `_dump_src.py` удалены. Оставлены инструменты:
   `_check.py`, `_regress.py`, `_live_test.py`, `_live_fixes.py`, `_patch_issues.py`, `tests/`.
+
+
+---
+
+изучить интерфейс для доработки или поиска интересных решений или вариантов решений способов работы с программой
+
+## 03–05.11.2026 — волна правок по трекеру заявок
+
+Закрыто 22 открытые заявки (в трекере стало `fixed=37`), на их месте заведены 2 новые
+честные заявки. Проверка: `GET /issues?status=open`.
+
+### Что теперь гарантировано в контракте API
+
+- `total` берётся только из позиции читалки «Док. N / total»; если не читается —
+  `total=null`, `pages=null`, `total_source="unavailable"`. Никаких «0 найдено» из ниоткуда.
+- `empty_reason` различает «правда нет документов» (`no_matches`, подтверждённый
+  `section_count=0`) и техническую неспособность прочитать GUI
+  (`tree_not_read`, `list_not_rendered`, `section_not_selected`, `results_page_not_opened`).
+  Второе всегда даёт `ok=false, retryable=true` и никогда не выглядит как пустая выдача.
+- Список перечисляется с повтором (2 попытки: сброс модалок → «Все результаты» → выбор
+  раздела), дерево разделов перечитывается до 3 раз до `unknown_category`.
+- Частичное чтение помечается честно: `expected_count`, `parsed_count`, `truncated=true` + note.
+- Анти-протечка прошлого списка: проверка заголовка страницы выдачи по запросу,
+  `rows_identical`, `stale_suspect`, `dropped_rows`; кэш-хит восстанавливает сессию
+  (`_hydrate_session`, `cached`, `_age`) и помечает `from_cache=true`.
+- Адресация строк: `docs[].ref="pos:<abs>"`, в `/doc`, `/sub`, `/open` принимаются
+  `index` (0-based, как в `docs[].index`), `row` (1-based) или `ref`; промах — 400 с
+  `valid_range`/`index_base`, чужой ref — 400 `ref_not_in_current_list`.
+- `/open` по заголовку: строгий скоринг `_score_title`, `exact_match`, `candidates[]`,
+  `404 doc_not_found` вместо чужого полнотекстового фрагмента; `502 results_page_not_opened`,
+  если страница результатов не открылась.
+- Контроль подмены открытого документа: `title_match=yes|no|unknown` (по словам и наборам
+  цифр/дат), при `no` — `ok=false` и прямой запрет использовать `content` как цитату.
+- Кодировка: RTF читается по `ansicpg` (cp1251), latin-1 фолбэк удалён, на границе API
+  работает `fix_mojibake()`; ответы несут `content_charset="utf-8"`, `mojibake_repaired`.
+- `/back` разворачивает стек (`depth` уменьшается, отдельный `back_events`), после ухода со
+  страницы выдачи `/doc`, `/sub`, `/page` дают 400 `no_openable_list`/`list_not_active`,
+  а `/state` гасит `current` и ставит `session_valid=false`.
+- `/health` больше не трогает GUI из второго потока, пока идёт навигация: `gui.probed`
+  и `gui.note` объясняют, прочитано ли окно на этот раз (прежде была гонка pywinauto).
+- Трекер: `PATCH /issues/<id>` умеет менять `description` и другие поля, неизвестное поле —
+  400 `unknown_field` (не молчаливое 200), `PATCH /issues` без id — 405 с JSON,
+  `note` пишется в `resolution_note` + `history`. `GET /issues?status=open|closed` — группы,
+  левый `status` — 400, ответ содержит `by_status` и `open_total`.
+- Дата среза базы: `CONSULTANT_INDEX_AS_OF` из окружения → `index_as_of_source="env ..."`,
+  fallback — auto-detect по штампам «ред. от / с изм. от» (`confidence="observed"`).
+
+### Яма дня: run_server.bat
+
+`CHCP 65001` + кириллические строки в `.bat`: cmd.exe ведёт позицию файла в **байтах**,
+поэтому после многобайтных REM следующие команды пропускались или резались посреди строки
+(в логе было видно `D:\ConsPlus>OSTCONSULTANT_PORT/`) — `SET CONSULTANT_INDEX_AS_OF` просто
+не выполнялся. Файл переписан **ASCII-only + CRLF**, запрет описан в его комментариях.
+Второй вывод: перезапускать надо снимая `cmd.exe /c run_server.bat` **раньше** python.exe,
+иначе Resurrector поднимает процесс со старым блоком окружения.
+
+### Открытые сейчас заявки
+
+- `e7f7bb098cfd` `/search`: в больших разделах список читается частично (1 из 5) или
+  не читается вовсе — ограничение UI-Automation списка К+, ответ хотя бы честный
+  (`truncated` / `list_not_rendered` + `section_count`).
+- `e15c0d424393` `/doc`: `consultant_gui.open_first_doc()` бьёт двойным кликом по
+  координатам (900,300) вместо элемента UIA — хрупкая навигация.
+
+### Как проверять (всё на BELOW_NORMAL, чтобы не вешать машину)
+
+- `powershell -File scripts\run_tests.ps1` — 67 тестов, вывод в `logs\tests_*.txt`.
+- `powershell -File scripts\restart_server.ps1` — честный перезапуск (cmd → python),
+  опрос `/health`, дерево процессов.
+- `powershell -File scripts\run_live_check.ps1` — 9 живых шагов по GUI → `logs\live_check.txt`.
+- `powershell -File scripts\verify_tracker.ps1` — снимок трекера.
+- `powershell -File scripts\smoke_api.ps1` — контрактные проверки без GUI (фильтры
+  `status=open|closed`, 400 на левом статусе, 405 на PATCH без id, 400 на неизвестном
+  поле) — идёт секунды, окно К+ не трогает.
+- `powershell -File scripts\enum_trace.ps1` — где именно рвётся перечисление списка
+  (маркеры `open_first_doc`, `goto_doc_index`, `next_doc`) по `logs\server.log`.
+- `scripts\close_issues.py` — образец PATCH-закрытия с resolution_note.
