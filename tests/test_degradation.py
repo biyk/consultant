@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server import app as A  # noqa: E402
 from server import config  # noqa: E402
 from server import rtf_util  # noqa: E402
-from server.consultant_gui import NotFound  # noqa: E402
+from server.consultant_gui import NotFound, parse_toc_entries  # noqa: E402
 
 
 class FakeGUI:
@@ -31,6 +31,7 @@ class FakeGUI:
         self.titles = []          # [(abs, title)]
         self.pos = (1, 0)         # (cur, total) из _doc_position
         self.export = ("Заголовок", "текст" * 50, [])  # (title, text, links)
+        self.toc = []             # [{'title', 'level'}] — что отдаёт read_toc
         self.selected = []
         self.fail_read = False
         self.page_state = ""      # что показывает окно после do_search
@@ -130,6 +131,10 @@ class FakeGUI:
 
     def export_current_doc(self, key):
         return tuple(self.export)
+
+    def read_toc(self):
+        self.toc_calls = getattr(self, "toc_calls", 0) + 1
+        return list(self.toc)
 
 
 def _cat(name, count=None, leaf=True):
@@ -602,6 +607,99 @@ class TestSub(BaseCase):
         self.assertEqual(len(j["entries"]), 1)
         self.assertEqual(j["entries"][0]["href"], "consultantplus://offline/ref=R1")
         self.assertTrue(j["hint"])
+
+
+# ---------------------------------------------------------------- /toc
+class TestParseTocEntries(unittest.TestCase):
+    """Чистый парсер дерева оглавления (без GUI): порядок, nbsp, уровни."""
+
+    def test_preserves_order_and_collapses_nbsp(self):
+        items = [("\u0420\u0430\u0437\u0434\u0435\u043b\xa0I.\xa0\u041e\u0431\u0449\u0438\u0435 \u043f\u043e\u043b\u043e\u0436\u0435\u043d\u0438\u044f", 377),
+                 ("\u0413\u043b\u0430\u0432\u0430\xa01.\xa0\u0417\u0430\u0434\u0430\u0447\u0438", 377)]
+        out = parse_toc_entries(items)
+        self.assertEqual(len(out), 2)
+        # nbsp свёрнут в обычный пробел, порядок сохранён
+        self.assertEqual(out[0]["title"], "\u0420\u0430\u0437\u0434\u0435\u043b I. \u041e\u0431\u0449\u0438\u0435 \u043f\u043e\u043b\u043e\u0436\u0435\u043d\u0438\u044f")
+        self.assertEqual(out[1]["title"], "\u0413\u043b\u0430\u0432\u0430 1. \u0417\u0430\u0434\u0430\u0447\u0438")
+
+    def test_level_guess(self):
+        items = [("\u0420\u0430\u0437\u0434\u0435\u043b I", 0), ("\u0427\u0430\u0441\u0442\u044c \u043f\u0435\u0440\u0432\u0430\u044f", 0),
+                 ("\u0413\u043b\u0430\u0432\u0430 12.", 0), ("\u0421\u0442\u0430\u0442\u044c\u044f 5", 0),
+                 ("\u00a7 3", 0), ("\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 1", 0)]
+        lvl = {e["title"]: e["level"] for e in parse_toc_entries(items)}
+        self.assertEqual(lvl["\u0420\u0430\u0437\u0434\u0435\u043b I"], 0)
+        self.assertEqual(lvl["\u0427\u0430\u0441\u0442\u044c \u043f\u0435\u0440\u0432\u0430\u044f"], 0)
+        self.assertEqual(lvl["\u0413\u043b\u0430\u0432\u0430 12."], 1)
+        self.assertEqual(lvl["\u0421\u0442\u0430\u0442\u044c\u044f 5"], 2)
+        self.assertEqual(lvl["\u00a7 3"], 2)
+        self.assertEqual(lvl["\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 1"], 1)   # неопознанный → 1
+
+    def test_drops_empty_and_blank(self):
+        items = [("", 0), ("   ", 0), ("\u00a0\u00a0", 0), ("\u0413\u043b\u0430\u0432\u0430 1", 0)]
+        out = parse_toc_entries(items)
+        self.assertEqual([e["title"] for e in out], ["\u0413\u043b\u0430\u0432\u0430 1"])
+
+
+class TestToc(BaseCase):
+    def _seed(self, docs=None, openable=True):
+        A.state["session"].update(
+            query="q", category="\u041d\u043e\u0440\u043c\u0430\u0442\u0438\u0432\u043d\u044b\u0435 \u0430\u043a\u0442\u044b", openable=openable,
+            docs=docs if docs is not None else
+            [{"index": 0, "abs": 1, "title": "\u041a\u041e\u0410\u041f", "ref": "pos:1"}])
+
+    def test_returns_toc_schema(self):
+        self._seed()
+        self.fake.toc = [{"title": "\u0420\u0430\u0437\u0434\u0435\u043b I. \u041e\u0431\u0449\u0438\u0435 \u043f\u043e\u043b\u043e\u0436\u0435\u043d\u0438\u044f", "level": 0},
+                         {"title": "\u0413\u043b\u0430\u0432\u0430 1.", "level": 1}]
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["count"], 2)
+        self.assertTrue(j["has_toc"])
+        self.assertEqual(j["toc"][0]["title"], "\u0420\u0430\u0437\u0434\u0435\u043b I. \u041e\u0431\u0449\u0438\u0435 \u043f\u043e\u043b\u043e\u0436\u0435\u043d\u0438\u044f")
+        self.assertEqual(j["matched_title"], "\u041a\u041e\u0410\u041f")
+        self.assertEqual(j["abs"], 1)
+        self.assertEqual(self.fake.toc_calls, 1)          # endpoint реально звал GUI
+        self.assertFalse(A.state["session"]["openable"])   # читалка увела с списка
+
+    def test_empty_toc_is_honest_not_error(self):
+        self._seed()
+        self.fake.toc = []                                  # документ не структурирован
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 200)
+        self.assertTrue(j["ok"])                            # это не сбой навигации
+        self.assertEqual(j["count"], 0)
+        self.assertFalse(j["has_toc"])
+        self.assertEqual(j["toc"], [])
+        self.assertTrue(j["message"])                        # но честно предупреждает
+
+    def test_resolves_by_row_and_ref(self):
+        self._seed(docs=[{"index": 0, "abs": 1, "title": "\u04141", "ref": "pos:1"},
+                         {"index": 1, "abs": 2, "title": "\u04142", "ref": "pos:2"}])
+        self.fake.toc = [{"title": "\u0413\u043b\u0430\u0432\u0430 1", "level": 1}]
+        s, j = self.post("/toc", {"row": 2})
+        self.assertEqual(j["matched_index"], 1)
+        self.assertEqual(j["abs"], 2)
+        # первый /toc увёл читалку на документ → список больше не адресуем;
+        # чтобы проверить разрешение по ref — перезаполним активную выдачу
+        self._seed(docs=[{"index": 0, "abs": 1, "title": "\u04141", "ref": "pos:1"},
+                         {"index": 1, "abs": 2, "title": "\u04142", "ref": "pos:2"}])
+        s2, j2 = self.post("/toc", {"ref": "pos:1"})
+        self.assertEqual(j2["matched_index"], 0)
+
+    def test_no_list_honest_400(self):
+        A.state["session"]["docs"] = []
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "no_openable_list")
+        self.assertTrue(j["retryable"])
+
+    def test_list_not_active_honest_400(self):
+        # после /back список не адресуем — /toc обязан честно отказать
+        self._seed(openable=False)
+        s, j = self.post("/toc", {"index": 0})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "list_not_active")
 
 
 # ---------------------------------------------------------------- /issues

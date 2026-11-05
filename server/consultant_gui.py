@@ -53,6 +53,38 @@ def _norm_title(s):
     return s.strip().lower()
 
 
+# Уровень пункта оглавления по началу заголовка (К+: Раздел/Часть → Глава →
+# Статья/§/пункт). Совсем не обязательная эвристика: level — подсказка, главный
+# смысл — упорядоченный список заголовков структуры.
+_TOC_LEVEL_PATTERNS = (
+    (re.compile(r"^\s*(\u0440\u0430\u0437\u0434\u0435\u043b|\u0447\u0430\u0441\u0442\u044c|\u043f\u043e\u0434\u0440\u0430\u0437\u0434\u0435\u043b)\b", re.I), 0),
+    (re.compile(r"^\s*\u0433\u043b\u0430\u0432\u0430\b", re.I), 1),
+    (re.compile(r"^\s*(\u0441\u0442\u0430\u0442\u044c\u044f|\u00a7|\u043f\u0443\u043d\u043a\u0442|\u0441\u0442\.\s|\u043f\.\s)|^\s*\d+\.\d+", re.I), 2),
+)
+
+
+def _toc_level(title):
+    for rx, lvl in _TOC_LEVEL_PATTERNS:
+        if rx.search(title or ""):
+            return lvl
+    return 1
+
+
+def parse_toc_entries(items):
+    """Из строк дерева оглавления [(name, left), …] (в визуальном порядке сверху
+    вниз) — чистый список [{title, level}]. Только ЧИСТАЯ функция (без GUI): её
+    можно тестировать офлайн. Пустые/пробельные имена отбрасываются, nbsp
+    сворачивается в обычный пробел, порядок сохраняется."""
+    out = []
+    for name, _left in items:
+        t = (name or "").replace("\u00a0", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            continue
+        out.append({"title": t, "level": _toc_level(t)})
+    return out
+
+
 # --- буфер обмена (кириллица без зависимости от раскладки) -------------------
 def _clip_set_text(text):
     win32clipboard.OpenClipboard()
@@ -845,6 +877,66 @@ class ConsultantGUI:
                     break
         LOG.info("close_extra_tabs: стало %d вкладок", len(tabs))
         return len(tabs)
+
+    def read_toc(self):
+        """Оглавление (структура) открытого документа.
+
+        Клик по кнопке «Оглавление» открывает UIA-дерево aid=1597
+        ('Оглавление документа КонсультантПлюс'), дети TreeItem — полная
+        иерархия (Раздел/Глава/Статья). В отличие от owner-drawn списка выдачи,
+        это дерево читается через UIA. Возвращает упорядоченный список
+        [{title, level}]; [] если оглавления нет (кнопка недоступна/не найдена
+        или документ не структурирован). В конце закрывает панель, чтобы оставить
+        клиент опрятным.
+        """
+        self.ensure_window()
+        try:
+            btn = self._button_by_name(config.BTN_TOC)
+        except NotFound:
+            LOG.info("read_toc: кнопки «Оглавление» нет — не читалка/нет структуры")
+            return []
+        try:
+            if not btn.is_enabled():
+                LOG.info("read_toc: «Оглавление» недоступна — структура не показана")
+                return []
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            btn.click_input()
+        except Exception as exc:  # noqa: BLE001
+            LOG.info("read_toc: клик «Оглавление» не удался: %r", exc)
+            return []
+        # ждать появления дерева оглавления (aid=1597)
+        tree = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            for e in self._descendants(control_type="Tree"):
+                if e.element_info.automation_id == config.AID_TOC_TREE:
+                    tree = e
+                    break
+            if tree is not None:
+                break
+            time.sleep(config.POLL)
+        entries = []
+        if tree is not None:
+            rows = []
+            for it in tree.descendants(control_type="TreeItem"):
+                try:
+                    nm = it.element_info.name or ""
+                    r = it.rectangle()
+                    rows.append((nm, r.top, r.left))
+                except Exception:  # noqa: BLE001
+                    continue
+            rows.sort(key=lambda z: z[1])            # сверху вниз по top
+            entries = parse_toc_entries([(nm, left) for nm, _top, left in rows])
+        # закрыть панель оглавления (обратный клик) — клиент остаётся чистым
+        try:
+            self._button_by_name(config.BTN_TOC).click_input()
+            time.sleep(0.4)
+        except Exception:  # noqa: BLE001
+            pass
+        LOG.info("read_toc: %d пунктов структуры", len(entries))
+        return entries
 
     def get_state(self):
         tabs = []

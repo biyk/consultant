@@ -120,6 +120,9 @@ def manifest():
             "POST /page": "{page} -> docs[] страницы",
             "POST /doc": "{index | ref} -> {kind,title,content,entries,links,matched_*}",
             "POST /sub": "{index | ref} -> подборка (content + entries[] с href)",
+            "POST /toc": "{index | row | ref} -> оглавление документа "
+                         "{toc:[{title,level}], count, has_toc} (структура "
+                         "Раздел/Глава/Статья; пусто, если не структурирован)",
             "POST /open": "{title} | {ref} | {uri} -> прямой доступ (404, если точного совпадения нет)",
             "POST /back": "-> вверх по стеку",
             "GET/POST/PATCH /issues": "трекер заявок; GET /issues?status=open|closed|<status>"
@@ -1179,6 +1182,47 @@ def sub():
     except GuiError as e:
         return jsonify({"ok": False, "kind": "unavailable", "error": "doc_unavailable",
                         "retryable": True, "message": str(e)}), 200
+
+
+@app.post("/toc")
+def toc():
+    """Оглавление (структура) документа — Раздел/Глава/Статья.
+
+    Берёт строку текущей выдачи (index|row|ref, как /doc), открывает её и читает
+    UIA-дерево «Оглавление документа» (кнопка «Оглавление»). Даёт навигацию по
+    крупному нормативному документу без экспорта всего тела. Если структуры нет —
+    честно возвращает пустой toc с has_toc=false (не ошибка)."""
+    b = _body()
+    sess = state["session"]
+    idx, err = _resolve_row(b, sess, "/toc")
+    if err:
+        return jsonify(err[0]), err[1]
+    docs = sess["docs"]
+    row = docs[idx]
+    base = {"matched_index": idx, "matched_title": row.get("title") or "",
+            "index_base": 0, "abs": row.get("abs"), "ref": row.get("ref"),
+            "requested": {k: b[k] for k in ("page", "index", "row", "ref") if k in b}}
+
+    def work():
+        _ensure_gui()
+        _gui.ensure_doc_open(row["abs"])
+        entries = _gui.read_toc() or []
+        # читалка осталась на документе — список больше не адресуем (как /open)
+        state["session"]["openable"] = False
+        return {"ok": True, "count": len(entries), "has_toc": bool(entries),
+                "toc": entries, **base,
+                "message": (None if entries else
+                            "у этого документа оглавления нет (не структурирован)"),
+                "note": "toc = структура открытого документа (кнопка «Оглавление»); "
+                        "для текста используй /doc"}
+
+    try:
+        return _respond(gui_call("/toc", work))
+    except Busy as e:
+        return jsonify({"ok": False, "error": "gui_busy", "busy": e.args[0]}), 504
+    except GuiError as e:
+        return jsonify({"ok": False, "error": "gui_error", "detail": str(e),
+                        "retryable": True, "toc": [], **base}), 502
 
 
 @app.post("/back")
