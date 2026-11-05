@@ -269,9 +269,82 @@ def main_oglavlenie():
     return 0
 
 
+def _find_tab_button(gui, name):
+    """Кнопка-вкладка типа в строке ~top=108 (не спутать с tree-элементами и
+    верхней навигацией top=42)."""
+    for b in gui.win.descendants(control_type="Button"):
+        n = (b.element_info.name or "")
+        if n.strip() != name:
+            continue
+        try:
+            if not b.is_visible():
+                continue
+            r = b.rectangle()
+            if 95 <= r.top <= 130:
+                return b
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def main_typefilter():
+    """Как вкладки типа материала (Все/Законодательство/Суд. практика/Консультации)
+    меняют список и total — понять, можно ли обернуть в /search по параметру type."""
+    from server.consultant_gui import ConsultantGUI
+    log("=== зонд ФИЛЬТРА ПО ТИПУ (query=%r) ===" % QUERY)
+    gui = ConsultantGUI()
+    try:
+        gui.connect(timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        log("СТОП: %r" % exc); return 2
+    gui.ensure_window(); gui.close_modal_dialogs(); gui.close_extra_tabs(keep=1)
+    if not gui.do_search(QUERY):
+        log("нет результатов"); return 3
+    gui.open_all_results(); time.sleep(1.0)
+    base_cats = [(c.get("name"), c.get("count")) for c in gui.read_categories()]
+    log("исходное дерево разделов: %r" % (base_cats,))
+    for tab in ("Все\xa0документы", "Все документы", "Законодательство",
+                "Судебная практика", "Консультации"):
+        btn = _find_tab_button(gui, tab)
+        if btn is None:
+            log("\n-- вкладка %r: НЕ найдена --" % tab); continue
+        log("\n-- вкладка %r: клик (%d,%d) --" % (tab, btn.rectangle().left,
+                                                   btn.rectangle().top))
+        try:
+            btn.click_input(); time.sleep(1.4)
+        except Exception as exc:  # noqa: BLE001
+            log("   клик упал: %r" % exc); continue
+        log("   state после клика: %r" % gui._state_suffix())
+        # изменилось ли левое дерево разделов?
+        try:
+            cats = [(c.get("name"), c.get("count")) for c in gui.read_categories()]
+            log("   разделы после клика: %r (изменилось=%s)" % (cats, cats != base_cats))
+        except Exception as exc:  # noqa: BLE001
+            log("   read_categories: %r" % exc)
+        # объём нового списка — через открытие первой строки (механизм enumerate)
+        try:
+            gui.ensure_list_page()
+            opened = gui.open_first_doc()
+            pos = gui._doc_position()
+            log("   список: открылся=%s pos(Док/total)=%r title=%r"
+                % (opened, pos, trunc(gui._doc_title(), 55)))
+            gui.go_back(); time.sleep(0.6)
+        except Exception as exc:  # noqa: BLE001
+            log("   open_first_doc: %r" % exc)
+    try:
+        gui.close_extra_tabs(keep=1)
+    except Exception:  # noqa: BLE001
+        pass
+    log("=== конец ===")
+    return 0
+
+
 def run():
-    if os.environ.get("PROBE_MODE", "").lower() == "oglavlenie":
+    mode = os.environ.get("PROBE_MODE", "").lower()
+    if mode == "oglavlenie":
         return main_oglavlenie()
+    if mode == "typefilter":
+        return main_typefilter()
     from server.consultant_gui import ConsultantGUI
     log("=== разведка функций клиента К+ (query=%r) ===" % QUERY)
     gui = ConsultantGUI()

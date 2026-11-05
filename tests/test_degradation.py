@@ -439,6 +439,63 @@ class TestSearch(BaseCase):
         self.assertIn("30 документов", j["note"])     # не выдаём это за «ничего не найдено»
 
 
+# ---------------------------------------------------------------- /search type
+class TestSearchType(BaseCase):
+    def test_type_practice_selects_section(self):
+        self.fake.cats = [_cat("\u0420\u043e\u0441\u0441\u0438\u0439\u0441\u043a\u043e\u0435 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u043e (\u0412\u0435\u0440\u0441\u0438\u044f \u041f\u0440\u043e\u0444)", 3614),
+                          _cat("\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430", 50)]
+        self.fake.titles = [(1, "\u041f\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435")]
+        self.fake.pos = (1, 50)
+        s, j = self.post("/search", {"query": "\u043d\u0435\u0443\u0441\u0442\u043e\u0439\u043a\u0430", "type": "practice",
+                                     "fresh": True})
+        self.assertEqual(s, 200)
+        self.assertEqual(j["selected_category"], "\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430")
+        self.assertEqual(j["requested_type"], "practice")
+        self.assertTrue(j["filter_applied"])
+        self.assertEqual(j["selection_rule"], "requested_category")
+        self.assertIn("\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430", self.fake.selected)
+
+    def test_type_law_maps_to_legislation(self):
+        self.fake.cats = [_cat("\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430", 99),
+                          _cat("\u0420\u043e\u0441\u0441\u0438\u0439\u0441\u043a\u043e\u0435 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u043e (\u0412\u0435\u0440\u0441\u0438\u044f \u041f\u0440\u043e\u0444)", 7)]
+        self.fake.titles = [(1, "\u0413\u041a \u0420\u0424")]
+        self.fake.pos = (1, 7)
+        s, j = self.post("/search", {"query": "\u0441\u0434\u0435\u043b\u043a\u0430", "type": "law", "fresh": True})
+        self.assertEqual(j["selected_category"],
+                         "\u0420\u043e\u0441\u0441\u0438\u0439\u0441\u043a\u043e\u0435 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u043e (\u0412\u0435\u0440\u0441\u0438\u044f \u041f\u0440\u043e\u0444)")
+
+    def test_bad_type_400(self):
+        s, j = self.post("/search", {"query": "q", "type": "zzz"})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "bad_type")
+        self.assertEqual(j["type"], "zzz")
+        for t in ("law", "practice", "consult", "all"):
+            self.assertIn(t, j["allowed"])
+
+    def test_type_and_category_conflict_400(self):
+        s, j = self.post("/search", {"query": "q", "type": "practice",
+                                     "category": "\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0438 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u0430"})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "type_and_category_conflict")
+
+    def test_type_all_is_default_first_leaf(self):
+        self.fake.cats = [_cat("\u0410\u043b\u044c\u0444\u0430", 1), _cat("\u0411\u0435\u0442\u0430", 999)]
+        self.fake.titles = [(1, "\u0414\u043e\u043a")]
+        self.fake.pos = (1, 1)
+        s, j = self.post("/search", {"query": "q", "type": "all", "fresh": True})
+        self.assertEqual(j["selected_category"], "\u0410\u043b\u044c\u0444\u0430")   # первый лист, не форсируем
+        self.assertEqual(j["requested_type"], "all")
+
+    def test_type_section_absent_honest_400(self):
+        # type=consult, а раздела «Комментарии законодательства» в дереве нет
+        self.fake.cats = [_cat("\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430", 10)]
+        s, j = self.post("/search", {"query": "q", "type": "consult", "fresh": True})
+        self.assertEqual(s, 400)
+        self.assertEqual(j["error"], "unknown_category")
+        self.assertEqual(j["requested_category"],
+                         "\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0438 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u0430")
+
+
 # ---------------------------------------------------------------- /doc
 class TestDoc(BaseCase):
     def _seed_session(self, docs=None, openable=True):

@@ -116,7 +116,9 @@ def manifest():
         "endpoints": {
             "GET /health": "{ok, gui, index_as_of...}",
             "GET /state": "{busy, current, depth, nav, tabs, session}",
-            "POST /search": "{query, page_size, category?, page?, fresh?} -> выдача",
+            "POST /search": "{query, page_size, category?, type?, page?, fresh?} -> "
+                             "выдача; type=law|practice|consult — алиас выбора "
+                             "раздела (зак-во/суд. практика/комментарии)",
             "POST /page": "{page} -> docs[] страницы",
             "POST /doc": "{index | ref} -> {kind,title,content,entries,links,matched_*}",
             "POST /sub": "{index | ref} -> подборка (content + entries[] с href)",
@@ -527,6 +529,16 @@ def _beyond_index_note(query):
     return None
 
 
+# type (фильтр по виду материала) -> каноническое имя раздела дерева К+.
+# Значения совпадают с CANONICAL_CATEGORIES; если раздела нет в текущем дереве
+# запроса — /search честно вернёт unknown_category (обработка как у category).
+_SEARCH_TYPES = {
+    "law": "\u0420\u043e\u0441\u0441\u0438\u0439\u0441\u043a\u043e\u0435 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u043e (\u0412\u0435\u0440\u0441\u0438\u044f \u041f\u0440\u043e\u0444)",
+    "practice": "\u0421\u0443\u0434\u0435\u0431\u043d\u0430\u044f \u043f\u0440\u0430\u043a\u0442\u0438\u043a\u0430",
+    "consult": "\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0438 \u0437\u0430\u043a\u043e\u043d\u043e\u0434\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u0430",
+}
+
+
 @app.post("/search")
 def search():
     b = _body()
@@ -537,6 +549,26 @@ def search():
     page = max(1, int(b.get("page") or 1))
     category = b.get("category")
     fresh = bool(b.get("fresh"))
+    # type — удобный алиас фильтра по виду материала. Зонд probe_discover показал,
+    # что верхние вкладки выдачи (Законодательство/Суд. практика/Консультации) НЕ
+    # меняют левое дерево разделов и наш гейт total==section_count, а «Консультации»
+    # вовсе не открылись — значит опираться на них нельзя. Фильтр делаем проверенным
+    # путём: сопоставляем type с именем раздела и идём через select_category.
+    typ = (b.get("type") or "").strip().lower()
+    requested_type = typ or None
+    if typ and typ != "all":
+        if typ not in _SEARCH_TYPES:
+            return jsonify({"ok": False, "error": "bad_type", "type": typ,
+                            "allowed": sorted(_SEARCH_TYPES) + ["all"],
+                            "hint": "type = law|practice|consult|all"}), 400
+        mapped = _SEARCH_TYPES[typ]
+        if category and _norm(category) != _norm(mapped):
+            return jsonify({"ok": False, "error": "type_and_category_conflict",
+                            "type": typ, "category": category,
+                            "hint": "type %r уже задаёт раздел %r — передай что-то одно"
+                                    % (typ, mapped)}), 400
+        category = mapped
+
 
     ckey = cache_store.search_key(query, category, page, page_size)
     if not fresh:
@@ -752,6 +784,7 @@ def search():
             "page": page, "page_size": page_size,
             "docs": docs_out, "categories": cats, "sections": sections,
             "selected_category": sel, "requested_category": category,
+            "requested_type": requested_type,
             "selection_rule": selection_rule, "section_count": sel_count,
             "scope": config.SCOPE_SINGLE_SECTION, "truncated": truncated,
             "parsed_count": len(docs_out), "expected_count": expected,
